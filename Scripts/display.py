@@ -18,6 +18,7 @@ The Sept. 9 Janus-channel mapping is hard-coded below.
 """
 
 import sys
+import re
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -138,6 +139,11 @@ def main():
         sys.exit(1)
 
     filename = sys.argv[1]
+
+    # Extract run number from filenames such as Run111_list.txt.
+    match = re.search(r"Run(\d+)", Path(filename).name, re.IGNORECASE)
+    run_label = f"Run {match.group(1)}" if match else Path(filename).stem
+
     gain = "LG"
     if len(sys.argv) == 4:
         if sys.argv[3].lower() != "-hg":
@@ -170,7 +176,8 @@ def main():
     norm = Normalize(vmin=vmin, vmax=vmax)
     #cmap = plt.get_cmap("viridis").copy()
     cmap = plt.get_cmap("plasma").copy()
-    cmap.set_bad("0.85")  # gray = not connected
+    #cmap = plt.get_cmap("rainbow").copy()
+    #cmap.set_bad("0.85")  # gray = not connected
 
     fig, ax = plt.subplots(figsize=(6.5, 9.5))
 
@@ -179,8 +186,8 @@ def main():
         np.ma.masked_invalid(image),
         origin="lower",
         aspect="auto",
-        #cmap=cmap,
-        cmap="Blues",
+        cmap=cmap,
+        #cmap="Blues",
         norm=norm,
         interpolation="nearest",
         extent=(-0.5, 3.5, -0.5, 15.5),
@@ -198,7 +205,7 @@ def main():
     ax.set_yticklabels(range(16))
     ax.set_xlabel("Detector board", fontsize=12)
     ax.set_ylabel("SiPM position", fontsize=12)
-    ax.set_title(f"TrgID {wanted_trgid} — {gain}", fontsize=14, fontweight="bold")
+    ax.set_title(f"{run_label} — TrgID {wanted_trgid} — {gain}", fontsize=14, fontweight="bold")
     ax.set_xlim(-0.5, 3.5)
     ax.set_ylim(-0.5, 15.5)
 
