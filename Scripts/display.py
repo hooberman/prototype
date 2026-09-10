@@ -3,16 +3,18 @@
 Display one Janus DT5202 Spect_Timing event as a 4-column x 16-row detector image.
 
 Usage:
-    python display.py FILE TrgID
+    python display.py FILE TrgID [-hg]
 
 Example:
     python display.py Run111_list.txt 545
+    python display.py Run111_list.txt 545 -hg
 
 Columns correspond to the four longitudinal SiPM boards around the cylinder:
     A  B  C  D
 Rows correspond to SiPM positions 0..15, with 0 at the bottom and 15 at the top.
 
-Color encodes HG counts.  The Sept. 9 Janus-channel mapping is hard-coded below.
+Color encodes LG counts by default. Use -hg to display HG counts instead.
+The Sept. 9 Janus-channel mapping is hard-coded below.
 """
 
 import sys
@@ -107,35 +109,42 @@ def read_event(filename, wanted_trgid):
     return event
 
 
-def make_image(event):
-    """Build a 16-row x 4-column HG image: columns A,B,C,D; row 0 is bottom."""
+def make_image(event, gain="LG"):
+    """Build a 16-row x 4-column image for LG or HG; row 0 is bottom."""
     image = np.full((16, 4), np.nan, dtype=float)
 
     for ch, (board, idx) in CHANNEL_MAP.items():
         if ch in event:
-            image[idx, BOARD_TO_COL[board]] = event[ch]["HG"]
+            image[idx, BOARD_TO_COL[board]] = event[ch][gain]
 
     return image
 
 
-def print_mapping(event):
-    print("\nJanus channel    HG    mapped channel")
+def print_mapping(event, gain="LG"):
+    print(f"\nJanus channel    {gain}    mapped channel")
     print("-------------  ------  --------------")
     for ch in sorted(CHANNEL_MAP):
         if ch not in event:
             continue
         board, idx = CHANNEL_MAP[ch]
-        hg = event[ch]["HG"]
-        print(f"{ch:13d}  {hg:6g}  {board}{idx}")
+        value = event[ch][gain]
+        print(f"{ch:13d}  {value:6g}  {board}{idx}")
     print()
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python display.py FILE TrgID")
+    if len(sys.argv) not in (3, 4):
+        print("Usage: python display.py FILE TrgID [-hg]")
         sys.exit(1)
 
     filename = sys.argv[1]
+    gain = "LG"
+    if len(sys.argv) == 4:
+        if sys.argv[3].lower() != "-hg":
+            print("ERROR: optional argument must be -hg")
+            sys.exit(1)
+        gain = "HG"
+
     try:
         wanted_trgid = int(sys.argv[2])
     except ValueError:
@@ -152,14 +161,15 @@ def main():
         print(f"ERROR: {exc}")
         sys.exit(1)
 
-    print_mapping(event)
-    image = make_image(event)
+    print_mapping(event, gain)
+    image = make_image(event, gain)
 
     finite = image[np.isfinite(image)]
     vmin = 0.0
     vmax = max(1.0, float(np.max(finite))) if finite.size else 1.0
     norm = Normalize(vmin=vmin, vmax=vmax)
-    cmap = plt.get_cmap("viridis").copy()
+    #cmap = plt.get_cmap("viridis").copy()
+    cmap = plt.get_cmap("plasma").copy()
     cmap.set_bad("0.85")  # gray = not connected
 
     fig, ax = plt.subplots(figsize=(6.5, 9.5))
@@ -169,7 +179,8 @@ def main():
         np.ma.masked_invalid(image),
         origin="lower",
         aspect="auto",
-        cmap=cmap,
+        #cmap=cmap,
+        cmap="Blues",
         norm=norm,
         interpolation="nearest",
         extent=(-0.5, 3.5, -0.5, 15.5),
@@ -185,16 +196,16 @@ def main():
     ax.set_xticklabels(["A", "B", "C", "D"], fontsize=13, fontweight="bold")
     ax.set_yticks(range(16))
     ax.set_yticklabels(range(16))
-    ax.set_xlabel("Detector board", fontsize=11)
-    ax.set_ylabel("SiPM position  (0 bottom → 15 top)", fontsize=11)
-    ax.set_title(f"TrgID {wanted_trgid} — HG", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Detector board", fontsize=12)
+    ax.set_ylabel("SiPM position", fontsize=12)
+    ax.set_title(f"TrgID {wanted_trgid} — {gain}", fontsize=14, fontweight="bold")
     ax.set_xlim(-0.5, 3.5)
     ax.set_ylim(-0.5, 15.5)
 
     sm = ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, pad=0.03)
-    cbar.set_label("HG counts", fontsize=11)
+    cbar.set_label(f"{gain} counts", fontsize=11)
 
     fig.tight_layout()
     out = f"event_{wanted_trgid}.png"
