@@ -19,13 +19,15 @@ Channel map (Sept 9 assignment)
 -------------------------------
     ch 0        -> CW top      (CosmicWatch trigger, drawn above the grid)
     ch 1        -> CW bottom   (CosmicWatch trigger, drawn below the grid)
-    ch 2..5     -> A1, C1, A2, C2  -- unconnected, shown but flagged "n/c"
+    ch 2..5     -> A1, C1, A2, C2  -- unconnected: greyed out in the maps
+                                      (values are still written to the table)
     ch 6..31    -> even = A(n/2),      odd = C((n-1)/2)      n = 3..15
     ch 32..63   -> even = B((n-32)/2), odd = D((n-33)/2)     n = 0..15
 """
 
 import argparse
 import os
+import re
 import sys
 
 import numpy as np
@@ -67,6 +69,15 @@ def build_channel_map():
 
 
 CHMAP = build_channel_map()
+
+
+def run_label(path):
+    """'Run124_list.txt' -> 'Run 124'; falls back to the bare file name."""
+    base = os.path.basename(path)
+    m = re.search(r"run[_\-\s]*0*(\d+)", base, re.IGNORECASE)
+    if m:
+        return "Run %s" % m.group(1)
+    return os.path.splitext(base)[0]
 
 
 # ----------------------------------------------------------------------------
@@ -201,13 +212,29 @@ def channel_stats(ch, lg, hg, ev, skip_events=0, robust=False):
 # plotting
 # ----------------------------------------------------------------------------
 def to_grid(values):
-    """64 channel values -> (16, 4) array indexed [row, col] with col A..D."""
+    """64 channel values -> (16, 4) array indexed [row, col] with col A..D.
+
+    Unconnected channels are left as NaN so they are greyed out.
+    """
     g = np.full((NROW, len(COLS)), np.nan)
     for ch, (name, col, row) in CHMAP.items():
-        if col is None:
+        if col is None or ch in UNCONNECTED:
             continue
         g[row, COLS.index(col)] = values[ch]
     return g
+
+
+def grid_cells_of(channels):
+    """set of (row, col index) cells occupied by the given channels."""
+    cells = set()
+    for ch in channels:
+        _, col, row = CHMAP[ch]
+        if col is not None:
+            cells.add((row, COLS.index(col)))
+    return cells
+
+
+UNCONNECTED_CELLS = grid_cells_of(UNCONNECTED)
 
 
 def fmt(v, vmax):
@@ -227,21 +254,26 @@ def text_colour(rgba):
 
 def draw_panel(fig, gs_cell, values, title, cmap_name, label):
     """One panel: CW-top strip, 16x4 grid, CW-bottom strip, shared colourbar."""
-    inner = gs_cell.subgridspec(3, 2, height_ratios=[1.0, 16.0, 1.0],
-                                width_ratios=[24, 1], hspace=0.10, wspace=0.04)
+    # row 1 is an empty spacer that keeps the CW-top box off the A/B/C/D labels
+    inner = gs_cell.subgridspec(4, 2, height_ratios=[1.0, 0.7, 16.0, 1.0],
+                                width_ratios=[24, 1], hspace=0.08, wspace=0.04)
     ax_top = fig.add_subplot(inner[0, 0])
-    ax_mid = fig.add_subplot(inner[1, 0])
-    ax_bot = fig.add_subplot(inner[2, 0])
+    ax_mid = fig.add_subplot(inner[2, 0])
+    ax_bot = fig.add_subplot(inner[3, 0])
     ax_cb = fig.add_subplot(inner[:, 1])
 
     grid = to_grid(values)
-    finite = values[np.isfinite(values)]
+    # colour scale from the connected channels only; z axis always starts at 0
+    conn = np.array([values[c] for c in range(NCH)
+                     if c not in UNCONNECTED and np.isfinite(values[c])])
+    finite = conn
+    vmin = 0.0
     if finite.size:
-        vmin, vmax = np.percentile(finite, [2, 98])
-        if vmin == vmax:
-            vmin, vmax = vmin - 0.5, vmax + 0.5
+        vmax = float(np.percentile(finite, 98))
+        if vmax <= vmin:
+            vmax = float(max(finite.max(), vmin + 1.0))
     else:
-        vmin, vmax = 0.0, 1.0
+        vmax = 1.0
 
     cmap = plt.get_cmap(cmap_name).copy()
     cmap.set_bad("#e8e8e8")
@@ -257,22 +289,12 @@ def draw_panel(fig, gs_cell, values, title, cmap_name, label):
             v = grid[r, c]
             x, y = c + 0.5, r + 0.5
             if not np.isfinite(v):
-                ax_mid.text(x, y, "--", ha="center", va="center",
-                            fontsize=6, color="#999999")
+                lab = "n/c" if (r, c) in UNCONNECTED_CELLS else "--"
+                ax_mid.text(x, y, lab, ha="center", va="center",
+                            fontsize=6, color="#8a8a8a")
                 continue
             ax_mid.text(x, y, fmt(v, scale), ha="center", va="center",
                         fontsize=6.5, color=text_colour(cmap(norm(v))))
-
-    # mark the unconnected channels
-    for ch in sorted(UNCONNECTED):
-        _, col, row = CHMAP[ch]
-        if col is None:
-            continue
-        c = COLS.index(col)
-        ax_mid.add_patch(Rectangle((c, row), 1, 1, fill=False, lw=1.3,
-                                   ls=(0, (3, 2)), ec="#d62728", zorder=3))
-        ax_mid.text(c + 0.94, row + 0.92, "n/c", ha="right", va="top",
-                    fontsize=5, color="#d62728", zorder=4)
 
     ax_mid.set_xticks(np.arange(len(COLS)) + 0.5)
     ax_mid.set_xticklabels(COLS, fontsize=9)
@@ -387,6 +409,9 @@ def main(argv=None):
     p.add_argument("--robust", action="store_true",
                    help="use median and 1.4826*MAD instead of mean and RMS "
                         "(better with HV on, where HG has a dark-count tail)")
+    p.add_argument("--runlabel", default=None,
+                   help="title text for the figure "
+                        "(default: 'Run N' taken from the file name)")
     p.add_argument("-o", "--outprefix", default=None,
                    help="output prefix (default: input file without .txt)")
     p.add_argument("--no-plot", action="store_true", help="skip the figure")
@@ -413,8 +438,7 @@ def main(argv=None):
                 args.robust)
 
     if not args.no_plot:
-        run = os.path.basename(src)
-        bits = [run]
+        bits = [args.runlabel or run_label(src)]
         if "Run start time" in header:
             bits.append(header["Run start time"])
         bits.append("%d events" % (n_events - args.skip_events))
