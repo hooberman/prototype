@@ -16,7 +16,13 @@ from them is echoed to the screen before any plotting.
 
 Usage
 -----
-    python makeEventDisplays.py RUNFILE.txt [-n 100]
+    python makeEventDisplays.py RUNFILE.txt [-n 100] [--normalize]
+
+--normalize switches the image from ADC to the share of the event: every cell
+is divided by the sum over the 58 cells of the image, the colour scale runs
+0-100 %, the cell labels carry two significant figures, and a vertical bar at
+the lower left shows the total that was divided out, on a fixed axis so the
+bars are comparable between events.
 
 Output
 ------
@@ -58,6 +64,13 @@ HG_SAT = 4000.0     # raw HG at or above this counts as saturated
 LG_SAT = 4000.0     # raw LG at or above this: even the LG branch is saturated
 NEVENTS = 100       # events drawn by default
 
+# --normalize: the vertical bar at the lower left runs 0 .. TOTAL_MAX ADC.
+# 250000 is the round number for Run126 -- its per-event sums over the 58
+# image cells peak just under 250 k (median ~30 k, 99th percentile ~155 k).
+# Fixed rather than per-run so the bars stay comparable between plots;
+# --total-max 0 recomputes it from the events actually drawn.
+TOTAL_MAX = 250000.0
+
 
 # ----------------------------------------------------------------------------
 # channel map
@@ -88,6 +101,39 @@ for _ch in UNCONNECTED:
     _, _col, _row = CHMAP[_ch]
     if _col is not None:
         UNCONNECTED_CELLS.add((_row, COLS.index(_col)))
+
+# the channels that make up the 4 x 16 image, i.e. what "sum over cells" means
+GRID_CH = [ch for ch, (_n, _c, _r) in sorted(CHMAP.items())
+           if _c is not None and ch not in UNCONNECTED]
+
+
+def grid_total(sig):
+    """Sum of the signal over the cells of the image (CW channels excluded)."""
+    return float(np.nansum(sig[GRID_CH]))
+
+
+def round_up_nice(x):
+    """Smallest 1/1.5/2/2.5/3/4/5/7.5 x 10^n that is >= x."""
+    if not np.isfinite(x) or x <= 0:
+        return 1.0
+    e = int(np.floor(np.log10(x)))
+    f = x / 10.0 ** e
+    for s in (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0):
+        if f <= s * (1.0 + 1e-9):
+            return s * 10.0 ** e
+    return 10.0 ** (e + 1)
+
+
+def two_sig_figs(v):
+    """'2.8', '34', '0.34', '100' -- two significant figures, no exponent."""
+    if not np.isfinite(v):
+        return "--"
+    if v == 0:
+        return "0"
+    d = 1 - int(np.floor(np.log10(abs(v))))
+    d = min(max(d, 0), 6)
+    s = "%.*f" % (d, v)
+    return "0" if s.strip("-0.") == "" else s
 
 
 def run_tag(path):
@@ -335,16 +381,46 @@ def _text_colour(rgba):
 
 
 def draw_event(sig, sat, both, out_png, title, subtitle,
-               vmin, vmax, cmap_name="inferno", logscale=False):
-    """4 columns A-D, rows 0-15 bottom to top, CW strips above and below."""
-    fig = plt.figure(figsize=(6.6, 9.6))
-    outer = fig.add_gridspec(4, 2, height_ratios=[1.0, 0.7, 16.0, 1.0],
-                             width_ratios=[24, 1], hspace=0.08, wspace=0.05,
-                             left=0.10, right=0.88, top=0.895, bottom=0.04)
+               vmin, vmax, cmap_name="inferno", logscale=False,
+               normalize=False, total=None, total_max=None, pct_max=None):
+    """4 columns A-D, rows 0-15 bottom to top, CW strips above and below.
+
+    With normalize=True every value is divided by `total`, the sum over the
+    cells of the image, and shown as a percentage; the colour scale then runs
+    0-100 % and a vertical bar at the lower left gives `total` itself against
+    a fixed 0 .. total_max axis, so the bar heights are comparable between
+    events.
+    """
+    if normalize:
+        fig = plt.figure(figsize=(6.6, 11.1))
+        outer = fig.add_gridspec(5, 2,
+                                 height_ratios=[1.0, 0.7, 16.0, 1.0, 3.4],
+                                 width_ratios=[24, 1], hspace=0.08, wspace=0.05,
+                                 left=0.10, right=0.88, top=0.912, bottom=0.035)
+        ax_cb = fig.add_subplot(outer[:4, 1])
+        inner = outer[4, 0].subgridspec(1, 6, wspace=0.0)
+        ax_tot = fig.add_subplot(inner[0, 0])
+    else:
+        fig = plt.figure(figsize=(6.6, 9.6))
+        outer = fig.add_gridspec(4, 2, height_ratios=[1.0, 0.7, 16.0, 1.0],
+                                 width_ratios=[24, 1], hspace=0.08, wspace=0.05,
+                                 left=0.10, right=0.88, top=0.895, bottom=0.04)
+        ax_cb = fig.add_subplot(outer[:, 1])
+        ax_tot = None
     ax_top = fig.add_subplot(outer[0, 0])
     ax_mid = fig.add_subplot(outer[2, 0])
     ax_bot = fig.add_subplot(outer[3, 0])
-    ax_cb = fig.add_subplot(outer[:, 1])
+
+    if normalize:
+        # every cell as a percentage of the sum over the cells
+        scale = 100.0 / total if (total and np.isfinite(total) and total != 0) \
+            else np.nan
+        sig = sig * scale
+        # 0-100 % unless the caller asked for a tighter ceiling with --zmax;
+        # with 58 cells the largest share is typically only a few per cent, so
+        # --zmax 10 is often the readable choice
+        vmin = 0.0
+        vmax = 10.0 if pct_max is None else pct_max
 
     grid = np.full((NROW, len(COLS)), np.nan)
     satgrid = np.zeros((NROW, len(COLS)), dtype=bool)
@@ -380,7 +456,7 @@ def draw_event(sig, sat, both, out_png, title, subtitle,
                             fontsize=6, color="#8a8a8a")
                 continue
             col = _text_colour(cmap(norm(max(v, norm.vmin))))
-            lab = "%.0f" % v
+            lab = two_sig_figs(v) if normalize else "%.0f" % v
             if lab == "-0":
                 lab = "0"
             ax_mid.text(x, y, lab, ha="center", va="center",
@@ -413,7 +489,9 @@ def draw_event(sig, sat, both, out_png, title, subtitle,
         if np.isfinite(v):
             fc = cmap(norm(max(v, norm.vmin)))
             tc = _text_colour(fc)
-            txt = "%s   %.0f%s" % (CHMAP[ch][0], v, "  S" if sat[ch] else "")
+            txt = "%s   %s%s" % (CHMAP[ch][0],
+                                 two_sig_figs(v) if normalize else "%.0f" % v,
+                                 "  S" if sat[ch] else "")
         else:
             fc, tc, txt = "#e8e8e8", "#555555", "%s   --" % CHMAP[ch][0]
         ax.add_patch(Rectangle((1.0, 0.06), 2.0, 0.88, facecolor=fc,
@@ -428,12 +506,54 @@ def draw_event(sig, sat, both, out_png, title, subtitle,
             sp.set_visible(False)
 
     cb = fig.colorbar(im, cax=ax_cb, extend="max")
-    cb.set_label("signal [HG ADC, pedestal subtracted]", fontsize=7)
+    if normalize:
+        cb.set_label("share of the event total [%]", fontsize=7)
+        cb.set_ticks(matplotlib.ticker.MaxNLocator(nbins=10, steps=[1, 2, 5, 10])
+                     .tick_values(0.0, vmax))
+        cb.ax.set_ylim(0, vmax)
+    else:
+        cb.set_label("signal [HG ADC, pedestal subtracted]", fontsize=7)
     cb.ax.tick_params(labelsize=6)
 
-    fig.suptitle(title, fontsize=13, y=0.985)
-    fig.text(0.5, 0.945, subtitle, ha="center", va="top", fontsize=8,
-             color="0.25")
+    # ---- the total that everything above was divided by ----
+    if normalize:
+        tmax = total_max if (total_max and total_max > 0) else 1.0
+        val = total if np.isfinite(total) else 0.0
+        ax_tot.bar([0], [max(val, 0.0)], width=0.62, color="0.35",
+                   edgecolor="0.15", lw=0.6, zorder=2)
+        ax_tot.set_xlim(-0.5, 0.5)
+        ax_tot.set_ylim(0, tmax)
+        ax_tot.set_xticks([])
+        ticks = matplotlib.ticker.MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]) \
+            .tick_values(0.0, tmax)
+        ticks = [t for t in ticks if 0 <= t <= tmax]
+        ax_tot.set_yticks(ticks)
+        ax_tot.set_yticklabels(["%g" % (t / 1000.0) for t in ticks],
+                               fontsize=5.5)
+        ax_tot.set_ylabel("total [k ADC]", fontsize=6, labelpad=2)
+        ax_tot.set_xlabel("sum over cells", fontsize=6.5, labelpad=2)
+        ax_tot.tick_params(length=2, pad=1.5)
+        ax_tot.grid(axis="y", color="0.85", lw=0.5, zorder=0)
+        ax_tot.set_axisbelow(True)
+        for sp in ("top", "right"):
+            ax_tot.spines[sp].set_visible(False)
+        # the number itself: inside the bar when there is room, else above it
+        top = min(max(val, 0.0), tmax)
+        inside = top > 0.18 * tmax
+        ax_tot.annotate("%.0f" % val, xy=(0, top),
+                        xytext=(0, -4 if inside else 3),
+                        textcoords="offset points", ha="center",
+                        va="top" if inside else "bottom", fontsize=6.5,
+                        color="white" if inside else "0.15", clip_on=False,
+                        zorder=3)
+        if val > tmax:
+            ax_tot.annotate("", xy=(0, tmax), xytext=(0, 0.93 * tmax),
+                            arrowprops=dict(arrowstyle="-|>", color="0.15",
+                                            lw=0.8))
+
+    fig.suptitle(title, fontsize=13, y=0.985 if not normalize else 0.987)
+    fig.text(0.5, 0.945 if not normalize else 0.955, subtitle, ha="center",
+             va="top", fontsize=8, color="0.25")
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
 
@@ -469,6 +589,16 @@ def main(argv=None):
                         "percentile over the events drawn)")
     p.add_argument("--zmin", type=float, default=0.0,
                    help="bottom of the colour scale (default 0)")
+    p.add_argument("--normalize", action="store_true",
+                   help="show every cell as a percentage of the sum over the "
+                        "cells instead of in ADC: colour scale 0-100 %%, cell "
+                        "labels to two significant figures, and a vertical "
+                        "bar at the lower left giving the total that was "
+                        "divided out")
+    p.add_argument("--total-max", type=float, default=TOTAL_MAX,
+                   help="top of the --normalize total bar, in ADC (default "
+                        "%g, the round number for Run126; 0 = pick one from "
+                        "the events actually drawn)" % TOTAL_MAX)
     p.add_argument("--per-event-scale", action="store_true",
                    help="rescale the colours for every event instead of "
                         "using one common scale")
@@ -527,19 +657,50 @@ def main(argv=None):
     else:
         gmax = 1.0
 
+    # ---- the per-event total, and the axis the --normalize bar runs on ----
+    totals = [grid_total(s) for s in sigs]
+    total_max = args.total_max
+    auto_max = not total_max or total_max <= 0
+    if args.normalize and auto_max:
+        total_max = round_up_nice(max(totals) if totals else 1.0)
+
     print("run file   %s" % src)
     print("events     %d drawn (first %d skipped), %d channels each"
           % (len(events), args.skip_events, NCH))
     print("signal     HG - HG_ped, or (LG - LG_ped) * %s%s when raw HG >= %g"
           % (args.scale_col, " + c" if args.use_intercept else "",
              args.hg_sat))
-    print("colour     %s, %.1f to %.1f%s"
-          % ("per event" if args.per_event_scale else "common",
-             args.zmin, gmax, "  (log)" if args.log else ""))
+    if args.normalize:
+        print("normalize  ON: each cell / (sum over the %d image cells) * 100"
+              % len(GRID_CH))
+        print("colour     0 to %g %%%s   (%s; --zmin/--per-event-scale "
+              "ignored)"
+              % (100.0 if args.zmax is None else args.zmax,
+                 "  (log)" if args.log else "",
+                 "default" if args.zmax is None
+                 else "--zmax caps the colour scale"))
+        biggest = max((100.0 * np.nanmax(s[GRID_CH]) / t) if t else 0.0
+                      for s, t in zip(sigs, totals))
+        print("           largest single-cell share among these events: "
+              "%.1f %%%s" % (biggest, "   <- consider --zmax %g"
+                             % round_up_nice(biggest)
+                             if args.zmax is None else ""))
+        print("totals     min %.0f  median %.0f  max %.0f ADC   ->  bar axis "
+              "0 to %g%s"
+              % (min(totals), float(np.median(totals)), max(totals), total_max,
+                 "  (auto, round)" if auto_max else ""))
+        over = sum(1 for t in totals if t > total_max)
+        if over:
+            print("           %d event(s) exceed the bar axis and are drawn "
+                  "clipped with an arrow; raise --total-max" % over)
+    else:
+        print("colour     %s, %.1f to %.1f%s"
+              % ("per event" if args.per_event_scale else "common",
+                 args.zmin, gmax, "  (log)" if args.log else ""))
     print("output     %s" % outdir)
 
     nsat_tot = 0
-    for ev, s, sa, bo in zip(events, sigs, sats, boths):
+    for ev, s, sa, bo, tot_cells in zip(events, sigs, sats, boths, totals):
         fin = s[np.isfinite(s)]
         if args.per_event_scale:
             vmax = float(np.nanmax(fin)) if fin.size else 1.0
@@ -556,9 +717,14 @@ def main(argv=None):
         sub = ("t = %.3f us    sum = %.0f ADC    channels > 0 : %d/%d"
                "    HG saturated : %d" %
                (ev["tstamp_us"], tot, nhit, NCH, nsat))
+        if args.normalize:
+            sub += "\ncells as %% of the sum over the %d image cells " \
+                   "(%.0f ADC)" % (len(GRID_CH), tot_cells)
         out_png = os.path.join(outdir, "%s_evt%05d.png" % (tag, ev["evt"]))
         draw_event(s, sa, bo, out_png, title, sub,
-                   args.zmin, vmax, cmap_name=args.cmap, logscale=args.log)
+                   args.zmin, vmax, cmap_name=args.cmap, logscale=args.log,
+                   normalize=args.normalize, total=tot_cells,
+                   total_max=total_max, pct_max=args.zmax)
 
     print("wrote %d png files to %s" % (len(events), outdir))
     print("  %d saturated HG channels in total were replaced by LG * scale"
