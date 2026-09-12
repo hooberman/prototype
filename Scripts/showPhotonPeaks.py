@@ -16,7 +16,11 @@ Output
     A, B, C, D are overlaid as black, red, blue and green step histograms of
     the raw HG ADC value, 0-100 in 20 bins.
 
-    RunX_photonPeaks.png next to the input file (override with -o).
+    RunX_photonPeaks.png                        all four columns overlaid
+    RunX_photonPeaks_A.png .. _D.png            one detector column each
+
+    All next to the input file; -o renames the combined plot and the per-
+    column ones follow it.  --no-per-column writes only the combined plot.
 
 Channel map (Sept 9 assignment)
 -------------------------------
@@ -46,9 +50,9 @@ TRIG_CH = {0, 1}                    # CosmicWatch trigger channels
 
 COLCOLOUR = {"A": "black", "B": "red", "C": "blue", "D": "green"}
 
-HG_LO = 0.0        # x axis of every panel
+HG_LO = 20.0       # x axis of every panel
 HG_HI = 100.0
-NBINS = 20
+NBINS = 80
 
 # panel order: 15 at the upper left, then decreasing left to right, top to
 # bottom, so row 0 ends up at the lower right
@@ -173,20 +177,22 @@ def read_hg(path, skip_events=1, max_events=None, column="HG"):
 # the plot
 # ----------------------------------------------------------------------------
 def make_plot(vals, out_png, title, subtitle, lo, hi, nbins,
-              logy=False, density=False, column="HG"):
+              logy=False, density=False, column="HG", cols=None):
+    """One 4x4 grid.  cols selects which detector columns to overlay."""
+    cols = list(COLS) if cols is None else list(cols)
     edges = np.linspace(lo, hi, nbins + 1)
     centres = 0.5 * (edges[:-1] + edges[1:])
 
-    fig, axes = plt.subplots(4, 4, figsize=(13.5, 11.0),
+    fig, axes = plt.subplots(4, 4, figsize=(14.5, 11.0),
                              sharex=True, sharey=not density)
-    fig.subplots_adjust(left=0.065, right=0.985, top=0.885, bottom=0.065,
-                        hspace=0.20, wspace=0.10)
+    fig.subplots_adjust(left=0.055, right=0.99, top=0.885, bottom=0.065,
+                        hspace=0.20, wspace=0.26)
 
     ymax = 0.0
     for k, row in enumerate(PANEL_ROWS):
         ax = axes[k // 4][k % 4]
         nplotted = 0
-        for col in COLS:
+        for col in cols:
             ch = CELL2CH.get((row, col))
             if ch is None:
                 continue
@@ -194,14 +200,15 @@ def make_plot(vals, out_png, title, subtitle, lo, hi, nbins,
             if x.size == 0:
                 continue
             h, _ = np.histogram(x, bins=edges, density=density)
-            ax.step(centres, h, where="mid", color=COLCOLOUR[col], lw=1.2,
-                    label="%s%d  (ch%02d)  n=%d" % (col, row, ch, x.size))
+            ax.step(centres, h, where="mid", color=COLCOLOUR[col], lw=1.0,
+                    label="%s%d  (ch%02d)" % (col, row, ch))
             ymax = max(ymax, float(h.max()) if h.size else 0.0)
             nplotted += 1
 
-        ax.set_title("row %d" % row, fontsize=10, pad=3)
-        ax.legend(fontsize=6.5, loc="upper right", frameon=False,
-                  handlelength=1.4, borderpad=0.2, labelspacing=0.25)
+        ax.set_title("Row %d" % row, fontsize=10, pad=3)
+        if nplotted:
+            ax.legend(fontsize=6.5, loc="upper right", frameon=False,
+                      handlelength=1.4, borderpad=0.2, labelspacing=0.25)
         ax.grid(alpha=0.25, lw=0.5)
         ax.set_xlim(lo, hi)
         if logy:
@@ -211,10 +218,10 @@ def make_plot(vals, out_png, title, subtitle, lo, hi, nbins,
                     ha="center", va="center", fontsize=9, color="0.5")
         if k // 4 == 3:
             ax.set_xlabel("%s ADC counts" % column, fontsize=9)
-        if k % 4 == 0:
-            ax.set_ylabel("events / bin" if not density else "normalised",
-                          fontsize=9)
-        ax.tick_params(labelsize=8)
+        ax.set_ylabel("events / bin" if not density else "normalised",
+                      fontsize=9)
+        # y tick labels on every panel, not just the left column
+        ax.tick_params(labelsize=8, labelleft=True)
 
     if not density and ymax > 0 and not logy:
         axes[0][0].set_ylim(0, 1.10 * ymax)
@@ -253,6 +260,9 @@ def main(argv=None):
     p.add_argument("--density", action="store_true",
                    help="normalise each channel to unit area instead of "
                         "plotting raw counts")
+    p.add_argument("--no-per-column", action="store_true",
+                   help="only write the combined A-D plot, not the one-plot-"
+                        "per-column versions")
     args = p.parse_args(argv)
 
     if not os.path.exists(args.listfile):
@@ -315,17 +325,30 @@ def main(argv=None):
               % (inrange_tot, ntot, 100.0 * inrange_tot / ntot))
     print("=" * 78)
 
-    sub = ("%d events  |  first %d skipped  |  %s ADC, %g-%g in %d bins  |  "
-           "A black, B red, C blue, D green"
-           % (nused, args.skip_events, args.column, args.xmin, args.xmax,
-              args.nbins))
-    if "Run start time" in header:
-        sub += "\n%s" % header["Run start time"]
+    base = ("%d events  |  first %d skipped  |  %s ADC, %g-%g in %d bins"
+            % (nused, args.skip_events, args.column, args.xmin, args.xmax,
+               args.nbins))
+    stamp = ("\n%s" % header["Run start time"]) if "Run start time" in header \
+        else ""
 
-    make_plot(vals, out_png, "%s   photon peaks" % tag, sub,
-              args.xmin, args.xmax, args.nbins,
-              logy=args.logy, density=args.density, column=args.column)
-    print("wrote %s" % out_png)
+    # ---- the combined A-D plot, then one plot per detector column ----
+    jobs = [(list(COLS), out_png,
+             "%s   photon peaks" % tag,
+             base + "  |  A black, B red, C blue, D green" + stamp)]
+
+    if not args.no_per_column:
+        stem, ext = os.path.splitext(out_png)
+        for col in COLS:
+            jobs.append(([col], "%s_%s%s" % (stem, col, ext),
+                         "%s   photon peaks   column %s" % (tag, col),
+                         base + "  |  column %s only (%s)"
+                         % (col, COLCOLOUR[col]) + stamp))
+
+    for cols, png, title, sub in jobs:
+        make_plot(vals, png, title, sub, args.xmin, args.xmax, args.nbins,
+                  logy=args.logy, density=args.density, column=args.column,
+                  cols=cols)
+        print("wrote %s" % png)
 
 
 if __name__ == "__main__":
