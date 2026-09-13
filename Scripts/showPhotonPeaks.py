@@ -14,13 +14,23 @@ Output
     15, 14, 13, 12  /  11, 10, 9, 8  /  7, 6, 5, 4  /  3, 2, 1, 0, so row 15
     is upper left and row 0 is lower right.  Within a panel the four columns
     A, B, C, D are overlaid as black, red, blue and green step histograms of
-    the raw HG ADC value, 0-100 in 20 bins.
+    the raw HG ADC value.
 
     RunX_photonPeaks.png                        all four columns overlaid
     RunX_photonPeaks_A.png .. _D.png            one detector column each
+    RunX_photonPeaks_all50.png                  the 50 active SiPMs together
 
-    All next to the input file; -o renames the combined plot and the per-
-    column ones follow it.  --no-per-column writes only the combined plot.
+    A matching .pdf is written beside each png; --no-pdf skips them.
+    All next to the input file; -o renames the combined plot and the others
+    follow it.  --no-per-column writes only the combined plot.
+
+The 50 active SiPMs
+-------------------
+Everything except rows 0, 1, 2 of all four columns and C4 and C12 -- the same
+set summed by makeTotalPhotonHisto.py and kept by pickPoCRows.py, i.e. the
+SiPMs that are connected and alive to bias:
+
+    A3-A15, B3-B15, C3 C5-C11 C13-C15, D3-D15
 
 Channel map (Sept 9 assignment)
 -------------------------------
@@ -54,6 +64,16 @@ HG_LO = 20.0       # x axis of every panel
 HG_HI = 100.0
 NBINS = 80
 
+# the 50 active SiPMs: everything except these
+EXCLUDE_ROWS = [0, 1, 2]            # these rows in every column
+EXCLUDE_CELLS = [("C", 4), ("C", 12)]
+
+# thinnest line that still renders solidly: 0.5 pt is one pixel at 150 dpi and
+# a true hairline in the pdf
+LINEWIDTH = 0.5
+YHEADROOM = 1.10                    # y axis top = this x the highest bin
+DPI = 150
+
 # panel order: 15 at the upper left, then decreasing left to right, top to
 # bottom, so row 0 ends up at the lower right
 PANEL_ROWS = list(range(NROW - 1, -1, -1))
@@ -82,6 +102,19 @@ for _ch, (_nm, _col, _row) in CHMAP.items():
         CELL2CH[(_row, _col)] = _ch
 
 
+def is_active(ch):
+    """True for the 50 connected, alive SiPMs."""
+    name, col, row = CHMAP[ch]
+    if col is None or ch in UNCONNECTED:
+        return False
+    if row in EXCLUDE_ROWS:
+        return False
+    return (col, row) not in EXCLUDE_CELLS
+
+
+ACTIVE_CH = [ch for ch in range(NCH) if is_active(ch)]
+
+
 def run_tag(path):
     """'Run125_list.txt' -> 'Run125'; falls back to the bare file name."""
     base = os.path.basename(path)
@@ -89,6 +122,11 @@ def run_tag(path):
     if m:
         return "Run%s" % m.group(1)
     return os.path.splitext(base)[0]
+
+
+def outputs(png, no_pdf):
+    """The png plus its matching pdf, unless pdfs are switched off."""
+    return [png] if no_pdf else [png, os.path.splitext(png)[0] + ".pdf"]
 
 
 # ----------------------------------------------------------------------------
@@ -174,24 +212,28 @@ def read_hg(path, skip_events=1, max_events=None, column="HG"):
 
 
 # ----------------------------------------------------------------------------
-# the plot
+# the 4 x 4 grid
 # ----------------------------------------------------------------------------
-def make_plot(vals, out_png, title, subtitle, lo, hi, nbins,
-              logy=False, density=False, column="HG", cols=None):
+def make_plot(vals, out_paths, title, subtitle, lo, hi, nbins,
+              logy=False, density=False, column="HG", cols=None,
+              per_panel_y=False):
     """One 4x4 grid.  cols selects which detector columns to overlay."""
     cols = list(COLS) if cols is None else list(cols)
     edges = np.linspace(lo, hi, nbins + 1)
     centres = 0.5 * (edges[:-1] + edges[1:])
 
+    share_y = (not density) and (not per_panel_y)
     fig, axes = plt.subplots(4, 4, figsize=(14.5, 11.0),
-                             sharex=True, sharey=not density)
-    fig.subplots_adjust(left=0.055, right=0.99, top=0.885, bottom=0.065,
-                        hspace=0.20, wspace=0.26)
+                             sharex=True, sharey=share_y)
+    fig.subplots_adjust(left=0.055, right=0.99, top=0.885, bottom=0.055,
+                        hspace=0.38, wspace=0.26)
 
-    ymax = 0.0
+    ymax = 0.0                      # highest bin anywhere in the figure
+    panel_max = {}                  # highest bin in each panel
     for k, row in enumerate(PANEL_ROWS):
         ax = axes[k // 4][k % 4]
         nplotted = 0
+        pmax = 0.0
         for col in cols:
             ch = CELL2CH.get((row, col))
             if ch is None:
@@ -200,10 +242,13 @@ def make_plot(vals, out_png, title, subtitle, lo, hi, nbins,
             if x.size == 0:
                 continue
             h, _ = np.histogram(x, bins=edges, density=density)
-            ax.step(centres, h, where="mid", color=COLCOLOUR[col], lw=1.0,
+            ax.step(centres, h, where="mid", color=COLCOLOUR[col],
+                    lw=LINEWIDTH, solid_joinstyle="miter",
                     label="%s%d  (ch%02d)" % (col, row, ch))
-            ymax = max(ymax, float(h.max()) if h.size else 0.0)
+            pmax = max(pmax, float(h.max()) if h.size else 0.0)
             nplotted += 1
+        ymax = max(ymax, pmax)
+        panel_max[k] = pmax
 
         ax.set_title("Row %d" % row, fontsize=10, pad=3)
         if nplotted:
@@ -216,21 +261,110 @@ def make_plot(vals, out_png, title, subtitle, lo, hi, nbins,
         if nplotted == 0:
             ax.text(0.5, 0.5, "no channels", transform=ax.transAxes,
                     ha="center", va="center", fontsize=9, color="0.5")
-        if k // 4 == 3:
-            ax.set_xlabel("%s ADC counts" % column, fontsize=9)
+        ax.set_xlabel("%s ADC counts" % column, fontsize=9, labelpad=1.5)
         ax.set_ylabel("events / bin" if not density else "normalised",
                       fontsize=9)
-        # y tick labels on every panel, not just the left column
-        ax.tick_params(labelsize=8, labelleft=True)
+        # tick labels on every panel, not just the outer row and column
+        ax.tick_params(labelsize=8, labelleft=True, labelbottom=True)
 
-    if not density and ymax > 0 and not logy:
-        axes[0][0].set_ylim(0, 1.10 * ymax)
+    # y axis top: YHEADROOM x the highest bin -- of the whole figure when the
+    # panels share an axis, of each panel on its own with --per-panel-y
+    if not density and not logy:
+        if per_panel_y:
+            for k in range(len(PANEL_ROWS)):
+                m = panel_max.get(k, 0.0)
+                axes[k // 4][k % 4].set_ylim(0, YHEADROOM * m if m > 0 else 1)
+        elif ymax > 0:
+            axes[0][0].set_ylim(0, YHEADROOM * ymax)
 
     fig.suptitle(title, fontsize=14, y=0.982)
     fig.text(0.5, 0.955, subtitle, ha="center", va="top", fontsize=9,
              color="0.25", linespacing=1.5)
-    fig.savefig(out_png, dpi=150)
+    for path in out_paths:
+        fig.savefig(path, dpi=DPI)
     plt.close(fig)
+    return ymax
+
+
+# ----------------------------------------------------------------------------
+# the 50 active SiPMs in one panel
+# ----------------------------------------------------------------------------
+def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
+               logy=False, column="HG", show_individual=False):
+    """One axis: the mean spectrum of the active SiPMs.
+
+    All 50 channels have the same number of entries -- one per event -- so the
+    pooled spectrum divided by 50 is the average channel.  With
+    show_individual the 50 channels are drawn faintly behind it, on the same
+    scale; the y axis then covers them too.
+    """
+    edges = np.linspace(lo, hi, nbins + 1)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+
+    fig, ax = plt.subplots(figsize=(11.0, 7.0))
+    fig.subplots_adjust(left=0.085, right=0.98, top=0.855, bottom=0.095)
+
+    pooled = np.zeros(nbins, dtype=float)
+    nch = 0
+    ntot = 0
+    ymax = 0.0
+    seen_cols = []
+    for ch in ACTIVE_CH:
+        x = vals[ch]
+        if x.size == 0:
+            continue
+        h, _ = np.histogram(x, bins=edges)
+        pooled += h
+        nch += 1
+        ntot += x.size
+        col = CHMAP[ch][1]
+        if show_individual:
+            ax.step(centres, h, where="mid", color=COLCOLOUR[col],
+                    lw=LINEWIDTH, solid_joinstyle="miter", alpha=0.30,
+                    zorder=2)
+            ymax = max(ymax, float(h.max()) if h.size else 0.0)
+        if col not in seen_cols:
+            seen_cols.append(col)
+
+    if nch == 0:
+        sys.exit("no active channels had any entries")
+
+    mean = pooled / float(nch)
+    ymax = max(ymax, float(mean.max()))
+    ax.fill_between(centres, mean, step="mid", color="0.2", alpha=0.10,
+                    zorder=3)
+    ax.step(centres, mean, where="mid", color="0.1", lw=1.6,
+            solid_joinstyle="miter", zorder=4,
+            label="mean of the %d SiPMs  (%d entries / %d)" % (nch, ntot, nch))
+
+    if show_individual:
+        handles = [plt.Line2D([], [], color=COLCOLOUR[c], lw=1.2, alpha=0.6,
+                              label="column %s" % c) for c in COLS
+                   if c in seen_cols]
+        handles.append(plt.Line2D([], [], color="0.1", lw=1.6,
+                                  label="mean of all %d" % nch))
+        ax.legend(handles=handles, fontsize=9, frameon=False,
+                  loc="upper right")
+    else:
+        ax.legend(fontsize=9, frameon=False, loc="upper right")
+
+    ax.set_xlabel("%s ADC counts" % column, fontsize=11)
+    ax.set_ylabel("events / bin, per SiPM", fontsize=11)
+    ax.set_xlim(lo, hi)
+    if logy:
+        ax.set_yscale("log")
+    else:
+        ax.set_ylim(0, YHEADROOM * ymax if ymax > 0 else 1)
+    ax.grid(alpha=0.25, lw=0.5)
+    ax.tick_params(labelsize=9)
+
+    fig.suptitle(title, fontsize=14, y=0.975)
+    fig.text(0.5, 0.935, subtitle, ha="center", va="top", fontsize=9,
+             color="0.25", linespacing=1.5)
+    for path in out_paths:
+        fig.savefig(path, dpi=DPI)
+    plt.close(fig)
+    return nch, ntot, ymax
 
 
 # ----------------------------------------------------------------------------
@@ -257,12 +391,24 @@ def main(argv=None):
                    help="number of bins (default %d)" % NBINS)
     p.add_argument("--logy", action="store_true",
                    help="logarithmic y axis")
+    p.add_argument("--per-panel-y", action="store_true",
+                   help="scale every panel of the grid to its own highest "
+                        "bin instead of sharing one y axis set by the highest "
+                        "bin in the figure")
     p.add_argument("--density", action="store_true",
                    help="normalise each channel to unit area instead of "
                         "plotting raw counts")
     p.add_argument("--no-per-column", action="store_true",
                    help="only write the combined A-D plot, not the one-plot-"
                         "per-column versions")
+    p.add_argument("--no-all50", action="store_true",
+                   help="skip the plot with all 50 active SiPMs together")
+    p.add_argument("--all50-individual", action="store_true",
+                   help="in the all-50 plot also draw the 50 individual "
+                        "channels faintly behind the mean (default: the mean "
+                        "alone, and the y axis then covers only the mean)")
+    p.add_argument("--no-pdf", action="store_true",
+                   help="only write the pngs, not the matching pdfs")
     args = p.parse_args(argv)
 
     if not os.path.exists(args.listfile):
@@ -281,6 +427,8 @@ def main(argv=None):
         os.path.dirname(os.path.abspath(args.listfile)),
         "%s_photonPeaks.png" % tag)
 
+    active_names = [CHMAP[ch][0] for ch in ACTIVE_CH]
+
     # ---- what was read ----
     print("=" * 78)
     print("file        %s" % args.listfile)
@@ -293,9 +441,12 @@ def main(argv=None):
     print("histogram   %s ADC, %g to %g in %d bins (%.3g counts/bin)"
           % (args.column, args.xmin, args.xmax, args.nbins,
              (args.xmax - args.xmin) / args.nbins))
+    print("active      %d SiPMs in the all-50 plot: %s"
+          % (len(ACTIVE_CH), " ".join(active_names)))
     print("-" * 78)
-    print("  %-5s %-6s %-8s %8s %8s %8s %8s"
-          % ("ch", "name", "colour", "entries", "median", "in range", "frac"))
+    print("  %-5s %-6s %-8s %-7s %8s %8s %8s %8s"
+          % ("ch", "name", "colour", "active", "entries", "median",
+             "in range", "frac"))
     inrange_tot = 0
     ntot = 0
     for row in PANEL_ROWS:
@@ -303,21 +454,23 @@ def main(argv=None):
             ch = CELL2CH.get((row, col))
             if ch is None:
                 continue
+            act = "yes" if is_active(ch) else "no"
             x = vals[ch]
             if x.size == 0:
-                print("  %-5d %-6s %-8s %8d %8s %8s %8s"
-                      % (ch, CHMAP[ch][0], COLCOLOUR[col], 0, "-", "-", "-"))
+                print("  %-5d %-6s %-8s %-7s %8d %8s %8s %8s"
+                      % (ch, CHMAP[ch][0], COLCOLOUR[col], act, 0, "-", "-",
+                         "-"))
                 continue
             inr = int(np.sum((x >= args.xmin) & (x <= args.xmax)))
             inrange_tot += inr
             ntot += x.size
-            print("  %-5d %-6s %-8s %8d %8.1f %8d %7.1f%%"
-                  % (ch, CHMAP[ch][0], COLCOLOUR[col], x.size,
+            print("  %-5d %-6s %-8s %-7s %8d %8.1f %8d %7.1f%%"
+                  % (ch, CHMAP[ch][0], COLCOLOUR[col], act, x.size,
                      float(np.median(x)), inr, 100.0 * inr / x.size))
     for ch in sorted(TRIG_CH | UNCONNECTED):
         x = vals[ch]
-        print("  %-5d %-6s %-8s %8d %8s   (not plotted)"
-              % (ch, CHMAP[ch][0].replace(" ", ""), "-", x.size,
+        print("  %-5d %-6s %-8s %-7s %8d %8s   (not plotted)"
+              % (ch, CHMAP[ch][0].replace(" ", ""), "-", "no", x.size,
                  "%.1f" % np.median(x) if x.size else "-"))
     print("-" * 78)
     if ntot:
@@ -336,19 +489,51 @@ def main(argv=None):
              "%s   photon peaks" % tag,
              base + "  |  A black, B red, C blue, D green" + stamp)]
 
+    stem, ext = os.path.splitext(out_png)
     if not args.no_per_column:
-        stem, ext = os.path.splitext(out_png)
         for col in COLS:
             jobs.append(([col], "%s_%s%s" % (stem, col, ext),
                          "%s   photon peaks   column %s" % (tag, col),
                          base + "  |  column %s only (%s)"
                          % (col, COLCOLOUR[col]) + stamp))
 
+    written = []
     for cols, png, title, sub in jobs:
-        make_plot(vals, png, title, sub, args.xmin, args.xmax, args.nbins,
-                  logy=args.logy, density=args.density, column=args.column,
-                  cols=cols)
-        print("wrote %s" % png)
+        paths = outputs(png, args.no_pdf)
+        top = make_plot(vals, paths, title, sub, args.xmin, args.xmax,
+                        args.nbins, logy=args.logy, density=args.density,
+                        column=args.column, cols=cols,
+                        per_panel_y=args.per_panel_y)
+        if not args.density and not args.logy:
+            print("y axis     %s: highest bin %.0f -> top %.0f"
+                  % (os.path.basename(png), top, YHEADROOM * top)
+                  if not args.per_panel_y else
+                  "y axis     %s: each panel scaled to its own highest bin"
+                  % os.path.basename(png))
+        written += paths
+
+    # ---- all 50 active SiPMs in one panel ----
+    if not args.no_all50:
+        png = "%s_all50%s" % (stem, ext)
+        paths = outputs(png, args.no_pdf)
+        nch, nent, top50 = make_all50(
+            vals, paths, "%s   photon peaks   all %d active SiPMs"
+            % (tag, len(ACTIVE_CH)),
+            base + ("  |  every active SiPM faint, their mean in black"
+                    if args.all50_individual
+                    else "  |  mean of the active SiPMs") + stamp,
+            args.xmin, args.xmax, args.nbins, logy=args.logy,
+            column=args.column, show_individual=args.all50_individual)
+        print("all50      %d SiPMs, %d entries pooled (%d per SiPM)"
+              % (nch, nent, nent // nch if nch else 0))
+        if not args.logy:
+            print("           highest bin %.1f -> y axis top %.1f"
+                  % (top50, YHEADROOM * top50))
+        written += paths
+
+    print("-" * 78)
+    for path in written:
+        print("wrote %s" % path)
 
 
 if __name__ == "__main__":
