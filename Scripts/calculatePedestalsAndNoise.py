@@ -23,6 +23,20 @@ Channel map (Sept 9 assignment)
                                       (values are still written to the table)
     ch 6..31    -> even = A(n/2),      odd = C((n-1)/2)      n = 3..15
     ch 32..63   -> even = B((n-32)/2), odd = D((n-33)/2)     n = 0..15
+
+--sixTrigs  (Sept 14 assignment)
+--------------------------------
+Six CosmicWatch paddles instead of two.  ch 2..5 stop being spare SiPM
+positions and become trigger channels, drawn in the strips beside the two
+they already had:
+
+    top     ch 2 CWA        ch 0 CW top       ch 3 CWB
+    grid                  A   B   C   D
+    bottom  ch 4 CWC        ch 1 CW bottom    ch 5 CWD
+
+The grid cells those channels would have occupied (A1, C1, A2, C2) stay empty
+and are labelled "trig" rather than "n/c", and ch 2..5 now count towards the
+colour scale, since they are real detectors and not dead inputs.
 """
 
 import argparse
@@ -40,6 +54,15 @@ NCH = 64
 COLS = ["A", "B", "C", "D"]          # left to right
 NROW = 16                            # 0 at the bottom, 15 at the top
 UNCONNECTED = {2, 3, 4, 5}           # real channels, but nothing plugged in
+
+# --sixTrigs: ch 2..5 are CosmicWatch paddles, not spare SiPM positions
+SIXTRIG_NAMES = {2: "CWA", 3: "CWB", 4: "CWC", 5: "CWD"}
+
+# which channels are drawn in the strip above and below the grid, left to
+# right.  Rebound by apply_six_trigs().
+TRIG_TOP = [0]
+TRIG_BOT = [1]
+SIXTRIGS = False
 
 
 # ----------------------------------------------------------------------------
@@ -69,6 +92,48 @@ def build_channel_map():
 
 
 CHMAP = build_channel_map()
+
+
+def apply_six_trigs():
+    """Turn ch 2..5 into the four extra CosmicWatch paddles.
+
+    Only the NAMES change in CHMAP; the column/row stay put so the grid cells
+    those channels would have filled are still recognised as empty and get
+    greyed out exactly as before.  The strips grow from one box to three.
+    """
+    global TRIG_TOP, TRIG_BOT, SIXTRIGS
+    for ch, name in SIXTRIG_NAMES.items():
+        _old, col, row = CHMAP[ch]
+        CHMAP[ch] = (name, col, row)
+    TRIG_TOP = [2, 0, 3]          # CWA   CW top    CWB
+    TRIG_BOT = [4, 1, 5]          # CWC   CW bottom CWD
+    SIXTRIGS = True
+
+
+def scale_channels():
+    """Channels whose values set the colour scale.
+
+    Normally the four unconnected inputs are left out, so a dead channel does
+    not drag the scale.  With --sixTrigs they are real paddles and belong in
+    it.
+    """
+    skip = set() if SIXTRIGS else UNCONNECTED
+    return [c for c in range(NCH) if c not in skip]
+
+
+def strip_boxes(n):
+    """x spans for n boxes across the grid width.
+
+    One box keeps the position it has always had (centred, 2 units wide); with
+    three the middle one stays centred, so CW top / CW bottom do not move.
+    """
+    if n <= 1:
+        return [(1.0, 3.0)]
+    w = float(len(COLS))
+    pad, gap = 0.10, 0.07
+    bw = (w - 2.0 * pad - (n - 1) * gap) / n
+    return [(pad + i * (bw + gap), pad + i * (bw + gap) + bw)
+            for i in range(n)]
 
 
 def run_label(path):
@@ -264,8 +329,8 @@ def draw_panel(fig, gs_cell, values, title, cmap_name, label):
 
     grid = to_grid(values)
     # colour scale from the connected channels only; z axis always starts at 0
-    conn = np.array([values[c] for c in range(NCH)
-                     if c not in UNCONNECTED and np.isfinite(values[c])])
+    conn = np.array([values[c] for c in scale_channels()
+                     if np.isfinite(values[c])])
     finite = conn
     vmin = 0.0
     if finite.size:
@@ -289,7 +354,8 @@ def draw_panel(fig, gs_cell, values, title, cmap_name, label):
             v = grid[r, c]
             x, y = c + 0.5, r + 0.5
             if not np.isfinite(v):
-                lab = "n/c" if (r, c) in UNCONNECTED_CELLS else "--"
+                empty = "trig" if SIXTRIGS else "n/c"
+                lab = empty if (r, c) in UNCONNECTED_CELLS else "--"
                 ax_mid.text(x, y, lab, ha="center", va="center",
                             fontsize=6, color="#8a8a8a")
                 continue
@@ -309,22 +375,33 @@ def draw_panel(fig, gs_cell, values, title, cmap_name, label):
     ax_mid.tick_params(which="major", length=2)
 
     # CosmicWatch trigger channels, above and below the grid
-    for ax, ch in ((ax_top, 0), (ax_bot, 1)):
-        name = CHMAP[ch][0]
-        v = values[ch]
+    for ax, chans in ((ax_top, TRIG_TOP), (ax_bot, TRIG_BOT)):
         ax.set_xlim(0, len(COLS))
         ax.set_ylim(0, 1)
-        if np.isfinite(v):
-            fc = cmap(norm(v))
-            tc = text_colour(fc)
-            txt = "%s   %s" % (name, fmt(v, scale))
-        else:
-            fc, tc, txt = "#e8e8e8", "#555555", "%s   --" % name
-        ax.add_patch(Rectangle((1.0, 0.06), 2.0, 0.88, facecolor=fc,
-                               edgecolor="0.35", lw=0.8))
-        ax.text(2.0, 0.5, txt, ha="center", va="center", fontsize=7, color=tc)
-        ax.text(0.06, 0.5, "ch%d" % ch, ha="left", va="center",
-                fontsize=6, color="0.4")
+        spans = strip_boxes(len(chans))
+        multi = len(chans) > 1
+        # with several boxes the channel number goes underneath each one,
+        # because there is no longer room for it out to the left
+        y0, y1 = (0.26, 0.97) if multi else (0.06, 0.94)
+        for (x0, x1), ch in zip(spans, chans):
+            name = CHMAP[ch][0]
+            v = values[ch]
+            if np.isfinite(v):
+                fc = cmap(norm(v))
+                tc = text_colour(fc)
+                txt = "%s   %s" % (name, fmt(v, scale))
+            else:
+                fc, tc, txt = "#e8e8e8", "#555555", "%s   --" % name
+            ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor=fc,
+                                   edgecolor="0.35", lw=0.8))
+            ax.text(0.5 * (x0 + x1), 0.5 * (y0 + y1), txt, ha="center",
+                    va="center", fontsize=6.5 if multi else 7, color=tc)
+            if multi:
+                ax.text(0.5 * (x0 + x1), 0.11, "ch%d" % ch, ha="center",
+                        va="center", fontsize=5.5, color="0.4")
+        if not multi:
+            ax.text(0.06, 0.5, "ch%d" % chans[0], ha="left", va="center",
+                    fontsize=6, color="0.4")
         ax.set_xticks([])
         ax.set_yticks([])
         for sp in ax.spines.values():
@@ -378,21 +455,29 @@ def write_table(stats, out_txt, src, header, n_events, skip, robust):
                 % (n_events, skip))
         f.write("# pedestal = %s of the ADC distribution, "
                 "noise = %s\n" % (centre, width))
-        f.write("# channel map: Sept 9 assignment "
-                "(ch2-5 unconnected, ch0/1 CosmicWatch)\n")
+        if SIXTRIGS:
+            f.write("# channel map: Sept 14 assignment "
+                    "(ch0/1 CW top/bottom, ch2-5 CWA/CWB/CWC/CWD)\n")
+        else:
+            f.write("# channel map: Sept 9 assignment "
+                    "(ch2-5 unconnected, ch0/1 CosmicWatch)\n")
         f.write("#%4s %10s %12s %12s %12s %12s %9s\n"
                 % ("ch", "name", "HG_ped", "HG_noise",
                    "LG_ped", "LG_noise", "N"))
         for c in range(NCH):
             name = CHMAP[c][0]
-            if c in UNCONNECTED:
+            if c in UNCONNECTED and not SIXTRIGS:
                 name += "*"
             f.write("%5d %10s %12.4f %12.4f %12.4f %12.4f %9d\n"
                     % (c, name,
                        stats["hg_mean"][c], stats["hg_rms"][c],
                        stats["lg_mean"][c], stats["lg_rms"][c],
                        stats["n"][c]))
-        f.write("# * = unconnected channel\n")
+        if SIXTRIGS:
+            f.write("# ch0-5 are CosmicWatch trigger paddles; the SiPM grid "
+                    "positions A1, C1, A2, C2 are empty\n")
+        else:
+            f.write("# * = unconnected channel\n")
 
 
 # ----------------------------------------------------------------------------
@@ -406,6 +491,13 @@ def main(argv=None):
                         "artifact); use 0 to keep everything")
     p.add_argument("--max-events", type=int, default=None,
                    help="stop after this many events")
+    p.add_argument("--sixTrigs", dest="sixTrigs", action="store_true",
+                   help="six CosmicWatch paddles instead of two: ch2 (CWA) "
+                        "and ch3 (CWB) are drawn either side of CW top, ch4 "
+                        "(CWC) and ch5 (CWD) either side of CW bottom, and "
+                        "all six count towards the colour scale (Sept 14 "
+                        "assignment).  Without it ch2-5 are treated as "
+                        "unconnected SiPM positions, as before.")
     p.add_argument("--robust", action="store_true",
                    help="use median and 1.4826*MAD instead of mean and RMS "
                         "(better with HV on, where HG has a dark-count tail)")
@@ -420,6 +512,9 @@ def main(argv=None):
     src = args.listfile
     if not os.path.exists(src):
         sys.exit("no such file: %s" % src)
+
+    if args.sixTrigs:
+        apply_six_trigs()
 
     prefix = args.outprefix
     if prefix is None:
@@ -442,6 +537,8 @@ def main(argv=None):
         if "Run start time" in header:
             bits.append(header["Run start time"])
         bits.append("%d events" % (n_events - args.skip_events))
+        if args.sixTrigs:
+            bits.append("6 trigger channels")
         if args.robust:
             bits.append("median / MAD")
         make_figure(stats, out_png, "Pedestals and noise   -   " +
