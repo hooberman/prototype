@@ -24,6 +24,13 @@ is divided by the sum over the 58 cells of the image, the colour scale runs
 the lower left shows the total that was divided out, on a fixed axis so the
 bars are comparable between events.
 
+--requireTrigger keeps only the events in which BOTH CosmicWatch channels
+fired -- raw HG above TRIG_HG_MIN on each of TRIG_CH -- and draws the first -n
+of those.  The whole file is read in that case, because how far in the first
+-n passing events lie is not known in advance.  Event numbers in the file
+names stay the original ones, so a gap in the numbering is the events the cut
+removed.
+
 Output
 ------
     RunX_plots/RunX_evtNNNNN.png    one image per event, X parsed from the
@@ -63,6 +70,11 @@ UNCONNECTED = {2, 3, 4, 5}           # real channels, but nothing plugged in
 HG_SAT = 4000.0     # raw HG at or above this counts as saturated
 LG_SAT = 4000.0     # raw LG at or above this: even the LG branch is saturated
 NEVENTS = 100       # events drawn by default
+
+# --requireTrigger: the two CosmicWatch channels, and the raw HG each of them
+# has to exceed for the event to be drawn
+TRIG_CH = (0, 1)            # ch0 = CW top, ch1 = CW bottom
+TRIG_HG_MIN = 1000.0
 
 # --normalize: the vertical bar at the lower left runs 0 .. TOTAL_MAX ADC.
 # 250000 is the round number for Run126 -- its per-event sums over the 58
@@ -105,6 +117,22 @@ for _ch in UNCONNECTED:
 # the channels that make up the 4 x 16 image, i.e. what "sum over cells" means
 GRID_CH = [ch for ch, (_n, _c, _r) in sorted(CHMAP.items())
            if _c is not None and ch not in UNCONNECTED]
+
+
+def passes_trigger(ev, chans=TRIG_CH, hgmin=TRIG_HG_MIN):
+    """True when every trigger channel has raw HG strictly above hgmin.
+
+    Raw HG, not pedestal subtracted: the threshold is a discriminator level on
+    the number the board actually wrote down.
+    """
+    hg = ev["hg"]
+    for c in chans:
+        if not 0 <= c < NCH:
+            return False
+        v = hg[c]
+        if not np.isfinite(v) or not v > hgmin:
+            return False
+    return True
 
 
 def grid_total(sig):
@@ -581,6 +609,13 @@ def main(argv=None):
     p.add_argument("--hg-sat", type=float, default=HG_SAT,
                    help="raw HG at or above this is saturated (default %g)"
                         % HG_SAT)
+    p.add_argument("--requireTrigger", action="store_true",
+                   help="only draw events in which both CosmicWatch channels "
+                        "fired: raw HG > %g on ch%d (%s) and ch%d (%s).  The "
+                        "whole file is read so that -n counts events that PASS "
+                        "the cut"
+                        % (TRIG_HG_MIN, TRIG_CH[0], CHMAP[TRIG_CH[0]][0],
+                           TRIG_CH[1], CHMAP[TRIG_CH[1]][0]))
     p.add_argument("--skip-events", type=int, default=1,
                    help="drop this many events from the start of the run "
                         "(default 1: event 0 is a start-of-run artifact)")
@@ -631,11 +666,22 @@ def main(argv=None):
     cfit = np.where(np.isfinite(sc["c"]), sc["c"], 0.0)
 
     # ---- events ----
-    want = args.skip_events + args.nevents
+    # with the trigger cut the whole file has to be read: there is no way to
+    # know up front how far in the first -n passing events lie
+    want = None if args.requireTrigger else args.skip_events + args.nevents
     header, events = parse_events(src, want)
     events = events[args.skip_events:]
     if not events:
         sys.exit("no events to draw from %s" % src)
+    ntrig_seen = len(events)
+    ntrig_pass = ntrig_seen
+    if args.requireTrigger:
+        events = [ev for ev in events if passes_trigger(ev)]
+        ntrig_pass = len(events)
+        if not events:
+            sys.exit("no events in %s pass --requireTrigger "
+                     "(raw HG > %g on ch%d and ch%d); %d events tested"
+                     % (src, TRIG_HG_MIN, TRIG_CH[0], TRIG_CH[1], ntrig_seen))
     events = events[:args.nevents]
 
     tag = run_tag(src)
@@ -675,6 +721,16 @@ def main(argv=None):
     print("signal     HG - HG_ped, or (LG - LG_ped) * %s%s when raw HG >= %g"
           % (args.scale_col, " + c" if args.use_intercept else "",
              args.hg_sat))
+    if args.requireTrigger:
+        print("trigger    --requireTrigger ON: raw HG > %g on ch%d (%s) and "
+              "ch%d (%s)"
+              % (TRIG_HG_MIN, TRIG_CH[0], CHMAP[TRIG_CH[0]][0],
+                 TRIG_CH[1], CHMAP[TRIG_CH[1]][0]))
+        print("           %d of %d events pass (%.2f %%); the first %d are "
+              "drawn"
+              % (ntrig_pass, ntrig_seen,
+                 100.0 * ntrig_pass / ntrig_seen if ntrig_seen else 0.0,
+                 len(events)))
     if args.normalize:
         print("normalize  ON: each cell / (sum over the %d image cells) * 100"
               % len(GRID_CH))
