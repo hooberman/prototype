@@ -51,11 +51,18 @@ array.
 
 Selection
 ---------
+    0.  --requireTrigger (optional): at least 2 of the six CosmicWatch
+        channels ch0-ch5 fired, a channel counting as fired when its RAW
+        HG > 1000 OR its RAW LG > 500.  Same criterion as
+        makeEventDisplays.py --requireTrigger.  Applied first, so the photon
+        fractions below are then quoted among the events that fired, and
+        '_requireTrigger' is added to the output file name.
     1.  total photons over the 4 x 11 array >= 1000
     2.  the column with the most photons (summed over the 4 SiPMs in it) is
         not one of the first two (0, 1) or the last two (9, 10)
 
-Both fractions are reported.  The first few events are printed in full so the
+Every fraction is reported, along with how many of the six paddles fired per
+event whether or not the cut is on.  The first few events are printed in full so the
 ring ordering and the conversion can be checked by eye.
 """
 
@@ -78,6 +85,14 @@ MIN_PHOTONS = 1000
 NEDGE = 2                        # columns barred at each end for the max
 NPRINT = 5
 REPORT_EVERY = 250000
+
+# --requireTrigger: the six CosmicWatch paddles.  A channel counts as fired
+# when raw HG > TRIG_HG_MIN or raw LG > TRIG_LG_MIN, and the event is kept
+# when at least TRIG_NMIN of the six fired.  Same criterion as
+# makeEventDisplays.py --requireTrigger.
+TRIG_HG_MIN = 1000.0
+TRIG_LG_MIN = 500.0
+TRIG_NMIN = 2
 
 
 # ----------------------------------------------------------------------------
@@ -103,6 +118,25 @@ for _ch, (_col, _ring) in CHMAP.items():
         CELL[_ch] = (COLS.index(_col), RING_HI - _ring)
 
 TRIG_CH = tuple(range(6))        # CW top, CW bottom, CWA, CWB, CWC, CWD
+TRIG_NAME = {0: "CW top", 1: "CW bottom", 2: "CWA", 3: "CWB", 4: "CWC",
+             5: "CWD"}
+
+
+def fired_trigger_channels(hg, lg, hgmin=TRIG_HG_MIN, lgmin=TRIG_LG_MIN):
+    """Which of ch0-5 fired, as a list of channel numbers.
+
+    A channel fires when its RAW HG is strictly above hgmin OR its RAW LG is
+    strictly above lgmin -- raw, not pedestal subtracted, because the
+    threshold is a discriminator level on the number the board wrote down.
+    The LG arm catches a paddle whose HG has saturated, which would otherwise
+    fail an HG-only cut.
+    """
+    out = []
+    for c in TRIG_CH:
+        h, l = hg.get(c), lg.get(c)
+        if (h is not None and h > hgmin) or (l is not None and l > lgmin):
+            out.append(c)
+    return out
 
 
 def photons(hg, lg, adc_per_photon=ADC_PER_PHOTON, lg_scale=LG_SCALE,
@@ -214,7 +248,8 @@ def evaluate(img, min_photons, nedge):
             "pass2": nedge <= imax < NRING - nedge}
 
 
-def show_event(n, trgid, img, res, nsat, min_photons, nedge):
+def show_event(n, trgid, img, res, nsat, min_photons, nedge,
+               fired=None, nmin=TRIG_NMIN):
     v1 = "PASS" if res["pass1"] else "fail"
     v2 = "PASS" if res["pass2"] else "fail"
     why = ""
@@ -226,6 +261,12 @@ def show_event(n, trgid, img, res, nsat, min_photons, nedge):
     print("event %-6d TrgID %-7d total = %-7d %s (>= %d)   max column = %-3d "
           "%s%s" % (n, trgid, res["total"], v1, min_photons, res["imax"],
                     v2, why))
+    if fired is not None:
+        print("              trigger %d/6 fired%s   %s"
+              % (len(fired),
+                 " [%s]" % ", ".join("ch%d %s" % (c, TRIG_NAME[c])
+                                     for c in fired) if fired else "",
+                 "PASS" if len(fired) >= nmin else "fail (need %d)" % nmin))
     if nsat:
         print("              %d channel(s) above HG %g -> LG * %g used there"
               % (nsat, HG_SAT, LG_SCALE))
@@ -272,6 +313,22 @@ def main(argv=None):
     p.add_argument("--edge", type=int, default=NEDGE, metavar="N",
                    help="selection 2: bar the max-photon column from the "
                         "first N and last N columns (default %d)" % NEDGE)
+    p.add_argument("--requireTrigger", action="store_true",
+                   help="also require at least %d of the six CosmicWatch "
+                        "channels ch0-ch5 to have fired, where fired means "
+                        "raw HG > %g OR raw LG > %g -- the same criterion as "
+                        "makeEventDisplays.py.  '_requireTrigger' is added to "
+                        "the default output file name"
+                        % (TRIG_NMIN, TRIG_HG_MIN, TRIG_LG_MIN))
+    p.add_argument("--trig-hg", type=float, default=TRIG_HG_MIN,
+                   help="raw HG above which a trigger channel counts as "
+                        "fired (default %g)" % TRIG_HG_MIN)
+    p.add_argument("--trig-lg", type=float, default=TRIG_LG_MIN,
+                   help="raw LG above which a trigger channel counts as "
+                        "fired (default %g)" % TRIG_LG_MIN)
+    p.add_argument("--trig-nmin", type=int, default=TRIG_NMIN,
+                   help="how many of the 6 trigger channels must fire "
+                        "(default %d)" % TRIG_NMIN)
     p.add_argument("--placeholder", action="store_true",
                    help="also write a 4 x %d block of -999999 before the "
                         "counts, in the slot the MC files use for the "
@@ -295,8 +352,10 @@ def main(argv=None):
         sys.exit("no such file: %s" % src)
 
     stem = src[:-4] if src.lower().endswith(".txt") else src
-    out_path = args.out or ("%s_formatted_%dphotons_innerRing3.txt"
-                            % (stem, args.min_photons))
+    out_path = args.out or ("%s_formatted_%dphotons_innerRing3%s.txt"
+                            % (stem, args.min_photons,
+                               "_requireTrigger" if args.requireTrigger
+                               else ""))
     if os.path.realpath(out_path) == os.path.realpath(src):
         sys.exit("the output would overwrite the input; use -o")
 
@@ -316,15 +375,22 @@ def main(argv=None):
     print("format     TrgID line%s, then 4 x %d counts"
           % (", 4 x %d placeholder block" % NRING if args.placeholder else "",
              NRING))
+    if args.requireTrigger:
+        print("trigger    --requireTrigger ON: >= %d of ch0-ch5 fired, where "
+              "fired = raw HG > %g OR raw LG > %g"
+              % (args.trig_nmin, args.trig_hg, args.trig_lg))
     if args.no_select:
-        print("selection  NONE (--no-select)")
+        print("selection  NONE (--no-select)%s"
+              % ("   -- the trigger cut still applies"
+                 if args.requireTrigger else ""))
     else:
         print("selection  1: total photons >= %d" % args.min_photons)
         print("           2: max column not in 0..%d or %d..%d"
               % (args.edge - 1, NRING - args.edge, NRING - 1))
     print("=" * 78)
 
-    n = n1 = n12 = nsat_tot = 0
+    n = nt = n1 = n12 = nsat_tot = 0
+    nfired_hist = [0] * (len(TRIG_CH) + 1)
     t0 = time.time()
     ph_line = " ".join(["-999999"] * NRING)
 
@@ -335,6 +401,12 @@ def main(argv=None):
                 break
             n += 1
 
+            fired = fired_trigger_channels(hg, lg, args.trig_hg,
+                                           args.trig_lg)
+            nfired_hist[len(fired)] += 1
+            trig_ok = (not args.requireTrigger) \
+                or len(fired) >= args.trig_nmin
+
             img, nsat = make_image(hg, lg, args.adc_per_photon,
                                    args.lg_scale, args.hg_sat)
             nsat_tot += nsat
@@ -342,7 +414,16 @@ def main(argv=None):
 
             if n <= args.nprint:
                 show_event(n - 1, trgid, img, res, nsat, args.min_photons,
-                           args.edge)
+                           args.edge,
+                           fired if args.requireTrigger else None,
+                           args.trig_nmin)
+
+            # the trigger cut comes first: it is a property of the event, not
+            # of the image, so the photon fractions below are quoted among
+            # the events that fired
+            if not trig_ok:
+                continue
+            nt += 1
 
             keep = args.no_select or (res["pass1"] and res["pass2"])
             if res["pass1"]:
@@ -369,20 +450,29 @@ def main(argv=None):
         out.close()
 
     dt = time.time() - t0
-    nwritten = n if args.no_select else n12
+    nwritten = nt if args.no_select else n12
+    base = nt if args.requireTrigger else n
 
     def frac(a, b):
         return "%.4f" % (a / b) if b else "n/a"
 
     print("=" * 78)
     print("  events read                         %8d" % n)
-    print("  pass 1 (>= %d photons)            %8d    fraction of all "
-          "= %s" % (args.min_photons, n1, frac(n1, n)))
+    if args.requireTrigger:
+        print("  pass --requireTrigger (>= %d of 6)   %8d    fraction of all "
+              "= %s" % (args.trig_nmin, nt, frac(nt, n)))
+    print("  pass 1 (>= %d photons)            %8d    fraction of %-9s "
+          "= %s" % (args.min_photons, n1,
+                    "triggered" if args.requireTrigger else "all",
+                    frac(n1, base)))
     print("  pass 1 and 2 (max column not edge)  %8d    fraction of pass 1 "
           "= %s" % (n12, frac(n12, n1)))
     print("  %-34s  %8d    fraction of all   = %s"
           % ("written to the output", nwritten, frac(nwritten, n)))
     print("-" * 78)
+    print("  trigger channels fired per event: %s"
+          % "  ".join("%d->%d" % (i, v)
+                      for i, v in enumerate(nfired_hist) if v))
     print("  %d channel(s) over HG %g in total took the LG * %g branch"
           % (nsat_tot, args.hg_sat, args.lg_scale))
     print("  %.1f s" % dt)
