@@ -51,8 +51,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 # ----------------------------------------------------------------------------
-PedestalAndNoiseFile = "Data/Run124_list_pedestalsAndNoise.txt"
-LGScaleFactor = "Data/Run125_list_LGscale.txt"
+PedestalAndNoiseFile = "Data/Run130_list_pedestalsAndNoise.txt"
+LGScaleFactor = "Data/Run131_list_LGscale.txt"
 # ----------------------------------------------------------------------------
 
 NCH = 64
@@ -587,6 +587,10 @@ def main(argv=None):
     p.add_argument("--zmax", type=float, default=None,
                    help="fix the top of the colour scale (default: 99th "
                         "percentile over the events drawn)")
+    p.add_argument("--zmax-pct", type=float, default=99.0,
+                   help="percentile of the SiPM cell values setting the top "
+                        "of the colour scale when --zmax is not given "
+                        "(default 99; use 100 for the single highest cell)")
     p.add_argument("--zmin", type=float, default=0.0,
                    help="bottom of the colour scale (default 0)")
     p.add_argument("--normalize", action="store_true",
@@ -647,12 +651,13 @@ def main(argv=None):
         sats.append(sa)
         boths.append(bo)
 
-    allsig = np.concatenate([s[np.isfinite(s)] for s in sigs]) \
-        if sigs else np.array([])
+    cellsig = [s[GRID_CH] for s in sigs]
+    allsig = np.concatenate([c[np.isfinite(c)] for c in cellsig]) \
+        if cellsig else np.array([])
     if args.zmax is not None:
         gmax = args.zmax
     elif allsig.size:
-        gmax = float(np.percentile(allsig, 99))
+        gmax = float(np.percentile(allsig, args.zmax_pct))
         gmax = max(gmax, args.zmin + 1.0)
     else:
         gmax = 1.0
@@ -702,8 +707,10 @@ def main(argv=None):
     nsat_tot = 0
     for ev, s, sa, bo, tot_cells in zip(events, sigs, sats, boths, totals):
         fin = s[np.isfinite(s)]
+        cells = s[GRID_CH]
+        cells = cells[np.isfinite(cells)]
         if args.per_event_scale:
-            vmax = float(np.nanmax(fin)) if fin.size else 1.0
+            vmax = float(cells.max()) if cells.size else 1.0
             vmax = max(vmax, args.zmin + 1.0)
         else:
             vmax = gmax
