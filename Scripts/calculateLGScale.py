@@ -51,7 +51,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 # ----------------------------------------------------------------------------
-PedestalNoiseFile = "Data/Run124_list_pedestalsAndNoise.txt"
+PedestalNoiseFile = "Data/Run130_list_pedestalsAndNoise.txt"
 # ----------------------------------------------------------------------------
 
 NCH = 64
