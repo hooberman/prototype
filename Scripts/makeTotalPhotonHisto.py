@@ -82,8 +82,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ----------------------------------------------------------------------------
-PedestalAndNoiseFile = "Data/Run124_list_pedestalsAndNoise.txt"
-LGScaleFactor = "Data/Run125_list_LGscale.txt"
+PedestalAndNoiseFile = "Data/Run130_list_pedestalsAndNoise.txt"
+LGScaleFactor = "Data/Run131_list_LGscale.txt"
 # ----------------------------------------------------------------------------
 
 ROWS = ["A", "B", "C", "D"]          # the four rows, in MC file order
