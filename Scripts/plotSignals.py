@@ -65,8 +65,8 @@ def main():
     parser.add_argument(
         "--bins",
         type=int,
-        default=60,
-        help="Number of histogram bins (default: 60)"
+        default=200,
+        help="Number of histogram bins (default: 200)"
     )
     args = parser.parse_args()
 
@@ -84,37 +84,43 @@ def main():
     sig = np.array([lg for _, lg in sig_entries])
     bkg = np.array([lg for _, lg in bkg_entries])
 
-    # Common binning so the two distributions can be compared directly.
-    xmin = min(sig.min(), bkg.min())
-    xmax = max(sig.max(), bkg.max())
+    # Plot range: 0-1000 counts, with all values >=1000 folded into
+    # the final visible bin as overflow.
+    plot_xmax = 1000.0
+    eps = 1e-6
 
-    # Add a small margin unless the range already spans the ADC limits.
-    span = max(xmax - xmin, 1)
-    lo = max(0, xmin - 0.02 * span)
-    hi = min(4096, xmax + 0.02 * span)
-    bins = np.linspace(lo, hi, args.bins + 1)
+    sig_plot = np.minimum(sig.astype(float), plot_xmax - eps)
+    bkg_plot = np.minimum(bkg.astype(float), plot_xmax - eps)
+
+    # Common binning for direct comparison.
+    bins = np.linspace(0, plot_xmax, args.bins + 1)
+
+    # Normalize each distribution to unit area.
+    sig_weights = np.ones_like(sig_plot, dtype=float) / len(sig_plot)
+    bkg_weights = np.ones_like(bkg_plot, dtype=float) / len(bkg_plot)
 
     fig, ax = plt.subplots(figsize=(9, 6))
 
     ax.hist(
-        bkg,
+        bkg_plot,
         bins=bins,
-        histtype="stepfilled",
-        alpha=0.45,
-        linewidth=1.8,
+        weights=bkg_weights,
+        histtype="step",
+        linewidth=2.0,
         label="Either CW fires",
     )
     ax.hist(
-        sig,
+        sig_plot,
         bins=bins,
-        histtype="stepfilled",
-        alpha=0.55,
-        linewidth=1.8,
+        weights=sig_weights,
+        histtype="step",
+        linewidth=2.0,
         label="Both CW fire",
     )
 
     ax.set_xlabel("Counts", fontsize=14)
-    ax.set_ylabel("SiPMs", fontsize=14)
+    ax.set_ylabel("Normalized SiPMs", fontsize=14)
+    ax.set_xlim(0, 1000)
     ax.set_title("PoC SiPM Low-Gain Response", fontsize=16, pad=12)
 
     ax.tick_params(axis="both", labelsize=12)
