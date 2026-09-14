@@ -33,6 +33,19 @@ locked to integer multiples of one free gain N -- the single-photoelectron
 spacing in HG ADC counts, which is the number this plot exists to measure.
 Each peak keeps its own free width, started at 20 and bounded to (5, 50).
 
+The background is held NON-NEGATIVE across the fit range.  Box bounds on p0,
+p1, p2 cannot say "this quadratic never dips below zero", so the background is
+fitted in the Bernstein basis of the fit interval instead,
+
+    bkg(x) = c0 (1-t)^2 + c1 2t(1-t) + c2 t^2 ,   t = (x - a) / (b - a)
+
+with c0, c1, c2 >= 0.  Every such curve is >= 0 on [a, b] because the basis
+functions are, and the fitted c are converted back to p0, p1, p2 for the
+report, so nothing downstream changes.  --allow-negative-bkg restores the old
+unconstrained polynomial, and --nobkg removes it altogether: the three
+coefficients are dropped from the parameter vector rather than set to zero, so
+they cost no degrees of freedom and ndf reflects what was actually fitted.
+
 N starts at 35 (--n-init) and the fit runs over 20 ADC and up (--fit-xmin),
 leaving the pedestal tail out of it; the plot still shows the whole range.
 --n-init 0 instead seeds N by scanning it over a grid and solving the
@@ -90,6 +103,13 @@ SIGMA_INIT = 20.0   # starting width of every peak
 SIGMA_LO = 5.0      # and the window it is allowed to move in
 SIGMA_HI = 50.0
 NSCAN = 400         # grid points in the seed scan over N
+
+# A "peak" wider than about half the spacing is not a peak -- adjacent ones
+# merge and the Gaussian starts doing the background's job, which is how the
+# comb slides away from its seed.  Widths are therefore fitted as a FRACTION
+# of N, bounded here, instead of as free absolute numbers.
+SIG_FRAC_LO = 0.05
+SIG_FRAC_HI = 0.50
 
 # The fit starts above the pedestal tail.  Below ~20 ADC the spectrum falls far
 # too steeply for a 2nd-order polynomial, and the comb gets dragged into it --
@@ -321,28 +341,90 @@ def make_plot(vals, out_paths, title, subtitle, lo, hi, nbins,
 # ----------------------------------------------------------------------------
 # the photon-peak fit
 # ----------------------------------------------------------------------------
-def peak_model(x, pars, npeaks):
-    """p0 + p1 x + p2 x^2 + sum_i A_i Gauss(mean = i*N, sigma = sigma_i)."""
-    x = np.asarray(x, dtype=float)
-    y = pars[0] + pars[1] * x + pars[2] * x * x
+def _peaks_only(x, pars, npeaks, ped=0.0, i0=1):
+    """The comb alone: sum_i A_i Gauss(mean = i*N, sigma = sigma_i)."""
+    y = np.zeros_like(x, dtype=float)
     gain = pars[3]
     for i in range(npeaks):
         amp = pars[4 + i]
         sig = pars[4 + npeaks + i]
-        y = y + amp * np.exp(-0.5 * ((x - (i + 1) * gain) / sig) ** 2)
+        y = y + amp * np.exp(-0.5 * ((x - (ped + (i0 + i) * gain))
+                                     / sig) ** 2)
     return y
 
 
-def _design(x, gain, sigmas, npeaks):
-    """Columns of the model that multiply the linear parameters."""
-    cols = [np.ones_like(x), x, x * x]
+def peak_model(x, pars, npeaks, ped=0.0, i0=1):
+    """p0 + p1 x + p2 x^2 + the comb.  pars[:3] are monomial coefficients."""
+    x = np.asarray(x, dtype=float)
+    return pars[0] + pars[1] * x + pars[2] * x * x \
+        + _peaks_only(x, pars, npeaks, ped, i0)
+
+
+# ---- the non-negative background -------------------------------------------
+# A quadratic written in the Bernstein basis of [a, b] with non-negative
+# coefficients is non-negative everywhere on [a, b], because the three basis
+# functions are.  That is the whole trick: an inequality on the CURVE becomes
+# three box bounds on the PARAMETERS, which is what curve_fit can enforce.
+def _bern_basis(x, a, b):
+    t = (np.asarray(x, dtype=float) - a) / float(b - a)
+    return np.vstack([(1.0 - t) ** 2, 2.0 * t * (1.0 - t), t * t]).T
+
+
+def _bern_bkg(x, c, a, b):
+    return _bern_basis(x, a, b) @ np.asarray(c, dtype=float)
+
+
+def _bern_to_poly(c, a, b):
+    """Bernstein coefficients -> (p0, p1, p2), and the Jacobian of that map."""
+    L = float(b - a)
+    m1 = np.array([[1.0, 0.0, 0.0],
+                   [-2.0, 2.0, 0.0],
+                   [1.0, -2.0, 1.0]])
+    m2 = np.array([[1.0, -a / L, a * a / (L * L)],
+                   [0.0, 1.0 / L, -2.0 * a / (L * L)],
+                   [0.0, 0.0, 1.0 / (L * L)]])
+    j = m2 @ m1
+    return j @ np.asarray(c, dtype=float), j
+
+
+def _design(x, gain, sigmas, npeaks, a=None, b=None, ped=0.0, i0=1, nbkg=3):
+    """Columns of the model that multiply the linear parameters.
+
+    With a and b given the first three columns are the Bernstein basis of
+    [a, b], so every linear coefficient of the model -- background and peak
+    amplitudes alike -- is one that must come out non-negative.  nbkg=0 drops
+    the background columns, leaving the comb on its own.
+    """
+    if nbkg == 0:
+        cols = []
+    elif a is None:
+        cols = [np.ones_like(x), x, x * x]
+    else:
+        cols = list(_bern_basis(x, a, b).T)
     for i in range(npeaks):
-        cols.append(np.exp(-0.5 * ((x - (i + 1) * gain) / sigmas[i]) ** 2))
+        cols.append(np.exp(-0.5 * ((x - (ped + (i0 + i) * gain))
+                                   / sigmas[i]) ** 2))
     return np.vstack(cols).T
 
 
+def _solve_linear(a, y, w, nonneg):
+    """Weighted linear solve, constrained to non-negative coefficients."""
+    aw, yw = a * w[:, None], y * w
+    if nonneg:
+        try:
+            from scipy.optimize import nnls
+            coef, _ = nnls(aw, yw)
+            return coef
+        except (ImportError, RuntimeError, ValueError):
+            coef, _, _, _ = np.linalg.lstsq(aw, yw, rcond=None)
+            return np.clip(coef, 0.0, None)
+    coef, _, _, _ = np.linalg.lstsq(aw, yw, rcond=None)
+    return coef
+
+
 def seed_gain(x, y, w, npeaks, sigma_init, sigma_lo, sigma_hi, n_lo, n_hi,
-              nscan=NSCAN):
+              nscan=NSCAN, a=None, b=None, nonneg=True, ped=0.0, i0=1,
+              nbkg=3):
     """Scan N; at each N the rest of the model is linear, so solve it exactly.
 
     The comb has a local minimum at every sub-multiple of the true spacing, so
@@ -357,13 +439,12 @@ def seed_gain(x, y, w, npeaks, sigma_init, sigma_lo, sigma_hi, n_lo, n_hi,
     for sg in widths:
         sig = [sg] * npeaks
         for gain in np.linspace(n_lo, n_hi, nscan):
-            a = _design(x, gain, sig, npeaks)
+            dm = _design(x, gain, sig, npeaks, a, b, ped, i0, nbkg)
             try:
-                coef, _, _, _ = np.linalg.lstsq(a * w[:, None], y * w,
-                                                rcond=None)
+                coef = _solve_linear(dm, y, w, nonneg)
             except np.linalg.LinAlgError:
                 continue
-            r = (a @ coef - y) * w
+            r = (dm @ coef - y) * w
             out.append((float(r @ r), float(gain), float(sg), coef))
     out.sort(key=lambda t: t[0])
     return out
@@ -383,7 +464,9 @@ def spread_seeds(scan, nseeds, n_lo, n_hi):
 
 def fit_photon_peaks(centres, y, yerr, npeaks=NPEAKS, sigma_init=SIGMA_INIT,
                      sigma_lo=SIGMA_LO, sigma_hi=SIGMA_HI,
-                     n_init=None, n_lo=None, n_hi=None, nseeds=5):
+                     n_init=None, n_lo=None, n_hi=None, nseeds=5,
+                     nonneg_bkg=True, sig_frac_lo=SIG_FRAC_LO,
+                     sig_frac_hi=SIG_FRAC_HI, ped=0.0, i0=1, nobkg=False):
     """Fit the comb.  Returns a dict, or None if scipy is missing."""
     try:
         from scipy.optimize import curve_fit
@@ -407,30 +490,82 @@ def fit_photon_peaks(centres, y, yerr, npeaks=NPEAKS, sigma_init=SIGMA_INIT,
     if not n_hi > n_lo:
         return {"ok": False, "why": "empty N range (%.3g, %.3g)" % (n_lo, n_hi)}
 
+    # the Bernstein basis lives on the fit interval, edge to edge
+    half = 0.5 * (x[1] - x[0])
+    xa, xb = float(x[0] - half), float(x[-1] + half)
+
+    # with --nobkg the three polynomial coefficients are not fitted at all --
+    # they are dropped from the parameter vector, so they cost no degrees of
+    # freedom, and padded back with zeros afterwards
+    nbkg = 0 if nobkg else 3
+
     scan = seed_gain(x, y, w, npeaks, sigma_init, sigma_lo, sigma_hi,
-                     n_lo, n_hi)
+                     n_lo, n_hi, a=xa if nonneg_bkg else None,
+                     b=xb if nonneg_bkg else None, nonneg=nonneg_bkg,
+                     ped=ped, i0=i0, nbkg=nbkg)
     if n_init is not None:
-        a = _design(x, float(n_init), [sigma_init] * npeaks, npeaks)
-        coef, _, _, _ = np.linalg.lstsq(a * w[:, None], y * w, rcond=None)
+        dm = _design(x, float(n_init), [sigma_init] * npeaks, npeaks,
+                     xa if nonneg_bkg else None, xb if nonneg_bkg else None,
+                     ped, i0, nbkg)
+        coef = _solve_linear(dm, y, w, nonneg_bkg)
         seeds = [(0.0, float(n_init), sigma_init, coef)]
     else:
         seeds = spread_seeds(scan, nseeds, n_lo, n_hi)
 
-    def model(xx, *pars):
-        return peak_model(xx, pars, npeaks)
+    # the width parameters carried through the fit are r_i = sigma_i / N
+    def _abs_pars(pars):
+        pars = np.asarray(pars, dtype=float)
+        out = pars.copy()
+        out[4 + npeaks:4 + 2 * npeaks] = pars[4 + npeaks:4 + 2 * npeaks] \
+            * pars[3]
+        return out
 
-    lo = [-np.inf, -np.inf, -np.inf, n_lo] + [0.0] * npeaks \
-        + [sigma_lo] * npeaks
-    hi = [np.inf, np.inf, np.inf, n_hi] + [np.inf] * npeaks \
-        + [sigma_hi] * npeaks
+    def _full(pars):
+        """Pad the fitted vector back out to p0, p1, p2, N, A..., r..., [P]."""
+        pars = np.asarray(pars, dtype=float)
+        return pars if nbkg == 3 else np.concatenate((np.zeros(3), pars))
+
+    def model(xx, *pars):
+        xx = np.asarray(xx, dtype=float)
+        fp = _full(pars)
+        if nbkg == 0:
+            bkg = 0.0
+        elif nonneg_bkg:
+            bkg = _bern_bkg(xx, fp[:3], xa, xb)
+        else:
+            bkg = fp[0] + fp[1] * xx + fp[2] * xx * xx
+        return bkg + _peaks_only(xx, _abs_pars(fp), npeaks,
+                                 fp[-1] if i0 == 0 else ped, i0)
+
+    if nbkg == 0:
+        bkg_lo, bkg_hi = [], []
+    elif nonneg_bkg:
+        bkg_lo, bkg_hi = [0.0] * 3, [np.inf] * 3
+    else:
+        bkg_lo, bkg_hi = [-np.inf] * 3, [np.inf] * 3
+
+    # the absolute sigma bounds still apply, as a fraction of the widest /
+    # narrowest gain the fit is allowed to reach
+    r_lo = max(sig_frac_lo, sigma_lo / n_hi)
+    r_hi = min(sig_frac_hi, sigma_hi / n_lo)
+    if not r_hi > r_lo:
+        r_lo, r_hi = sig_frac_lo, sig_frac_hi
+
+    lo = bkg_lo + [n_lo] + [0.0] * npeaks + [r_lo] * npeaks
+    hi = bkg_hi + [n_hi] + [np.inf] * npeaks + [r_hi] * npeaks
+    if i0 == 0:                       # the pedestal position, fitted last
+        lo = lo + [xa]
+        hi = hi + [xa + n_hi]
     lo = np.asarray(lo, dtype=float)
     hi = np.asarray(hi, dtype=float)
 
     best = None
     for _chi2, gain, sg, coef in seeds:
-        amps = np.clip(np.asarray(coef[3:], dtype=float), 1e-6, None)
-        p_init = np.concatenate(([coef[0], coef[1], coef[2], gain], amps,
-                                 np.full(npeaks, sg)))
+        coef = np.asarray(coef, dtype=float)
+        amps = np.clip(coef[nbkg:], 1e-6, None)
+        p_init = np.concatenate((coef[:nbkg], [gain], amps,
+                                 np.full(npeaks, sg / max(gain, 1e-9)),
+                                 [ped] if i0 == 0 else []))
         p_init = np.clip(p_init, lo + 1e-9, hi - 1e-9)
         try:
             popt, pcov = curve_fit(model, x, y, p0=p_init, sigma=err,
@@ -447,11 +582,53 @@ def fit_photon_peaks(centres, y, yerr, npeaks=NPEAKS, sigma_init=SIGMA_INIT,
         return {"ok": False, "why": "the fit did not converge from any seed"}
 
     chi2, popt, pcov = best
+    ndf = len(x) - len(popt)        # the dropped background costs nothing
+
+    if nbkg == 0:                   # pad the zero background back in
+        popt = np.concatenate((np.zeros(3), popt))
+        big = np.zeros((len(popt), len(popt)))
+        big[3:, 3:] = pcov
+        pcov = big
     with np.errstate(invalid="ignore"):
         perr = np.sqrt(np.abs(np.diag(pcov)))
-    ndf = len(x) - len(popt)
+
+    # sigma_i = r_i * N: convert back and push the covariance through
+    n_par = 4 + 2 * npeaks
+    jr = np.eye(len(popt))
+    gain_v = popt[3]
+    for i in range(npeaks):
+        k = 4 + npeaks + i
+        jr[k, 3] = popt[k]          # d sigma_i / dN  = r_i
+        jr[k, k] = gain_v           # d sigma_i / dr_i = N
+    popt = popt.copy()
+    popt[4 + npeaks:4 + 2 * npeaks] *= gain_v
+    pcov = jr @ pcov @ jr.T
+    ped_fit = float(popt[-1]) if i0 == 0 else float(ped)
+    ped_err = float(np.sqrt(abs(pcov[-1, -1]))) if i0 == 0 else 0.0
+    popt, pcov = popt[:n_par], pcov[:n_par, :n_par]
+    with np.errstate(invalid="ignore"):
+        perr = np.sqrt(np.abs(np.diag(pcov)))
+
+    bkg_min = None
+    if nonneg_bkg and nbkg == 3:
+        # hand back monomial coefficients, so peak_model and every printout
+        # keep working unchanged
+        pc, jac = _bern_to_poly(popt[:3], xa, xb)
+        cov_p = jac @ pcov[:3, :3] @ jac.T
+        popt = np.concatenate((pc, popt[3:]))
+        with np.errstate(invalid="ignore"):
+            perr = np.concatenate((np.sqrt(np.abs(np.diag(cov_p))), perr[3:]))
+    xs = np.linspace(xa, xb, 512)
+    bkg_min = float(np.min(popt[0] + popt[1] * xs + popt[2] * xs * xs))
+
+    with np.errstate(invalid="ignore"):
+        perr = np.sqrt(np.abs(np.diag(pcov)))
 
     return {"ok": True, "npeaks": npeaks, "p": popt, "e": perr,
+            "ped": ped_fit, "ped_err": ped_err, "i0": int(i0),
+            "nonneg_bkg": bool(nonneg_bkg), "bkg_min": bkg_min,
+            "nobkg": bool(nobkg),
+            "bern_a": xa, "bern_b": xb,
             "chi2": chi2, "ndf": ndf,
             "gain": float(popt[3]), "gain_err": float(perr[3]),
             "bkg": popt[:3], "bkg_err": perr[:3],
@@ -462,7 +639,9 @@ def fit_photon_peaks(centres, y, yerr, npeaks=NPEAKS, sigma_init=SIGMA_INIT,
             "scan": [(c, g) for c, g, _s, _k
                      in spread_seeds(scan, 6, n_lo, n_hi)],
             "sigma_lo": float(sigma_lo), "sigma_hi": float(sigma_hi),
-            "sigma_init": float(sigma_init)}
+            "sigma_init": float(sigma_init),
+            "n_seed": float(n_init) if n_init is not None else None,
+            "r_lo": float(r_lo), "r_hi": float(r_hi)}
 
 
 def fit_lines(fit):
@@ -474,13 +653,21 @@ def fit_lines(fit):
              % ("peak", "mean", "amplitude", "sigma")]
     for i in range(fit["npeaks"]):
         lines.append("%-6d %9.2f %6.1f\u00b1%-5.1f %5.1f\u00b1%-5.1f"
-                     % (i + 1, (i + 1) * fit["gain"],
+                     % (fit.get("i0", 1) + i,
+                        fit["ped"] + (fit.get("i0", 1) + i) * fit["gain"],
                         fit["amp"][i], fit["amp_err"][i],
                         fit["sig"][i], fit["sig_err"][i]))
     lines.append("")
-    lines.append("background  p0 = %.4g \u00b1 %.2g" % (b[0], be[0]))
-    lines.append("            p1 = %.4g \u00b1 %.2g" % (b[1], be[1]))
-    lines.append("            p2 = %.4g \u00b1 %.2g" % (b[2], be[2]))
+    if fit.get("nobkg"):
+        lines.append("background  none (--nobkg)")
+    else:
+        lines.append("background  p0 = %.4g \u00b1 %.2g" % (b[0], be[0]))
+        lines.append("            p1 = %.4g \u00b1 %.2g" % (b[1], be[1]))
+        lines.append("            p2 = %.4g \u00b1 %.2g" % (b[2], be[2]))
+        if fit.get("bkg_min") is not None:
+            lines.append("            min = %.4g%s"
+                         % (fit["bkg_min"],
+                            "  (>= 0)" if fit.get("nonneg_bkg") else ""))
     lines.append("")
     lines.append("chi2/ndf = %.1f / %d = %.2f"
                  % (fit["chi2"], fit["ndf"],
@@ -496,14 +683,18 @@ def print_fit(fit):
         print("=" * 78)
         return
     k = fit["npeaks"]
-    print("fit        background(2nd order) + %d photon peaks at N, 2N, ... %dN"
-          % (k, k))
-    print("           y = p0 + p1 x + p2 x^2 + SUM A_i exp(-0.5 ((x-iN)/s_i)^2)")
+    print("fit        %s%d photon peaks at N, 2N, ... %dN"
+          % ("" if fit.get("nobkg") else "background(2nd order) + ", k, k))
+    print("           y = %sSUM A_i exp(-0.5 ((x-(P+iN))/s_i)^2)"
+          % ("" if fit.get("nobkg") else "p0 + p1 x + p2 x^2 + "))
     print("           fitted over %.4g to %.4g ADC"
           % (fit.get("fit_lo", float("nan")), fit.get("fit_hi", float("nan"))))
-    print("           N in (%.3g, %.3g);  sigma start %.3g, in (%.3g, %.3g)"
-          % (fit["n_lo"], fit["n_hi"], fit["sigma_init"],
-             fit["sigma_lo"], fit["sigma_hi"]))
+    print("           N in (%.3g, %.3g), seeded at %s;  sigma/N in "
+          "(%.3g, %.3g) -> sigma in (%.3g, %.3g) at this N"
+          % (fit["n_lo"], fit["n_hi"],
+             "%.4g" % fit["n_seed"] if fit.get("n_seed") else "the scan best",
+             fit["r_lo"], fit["r_hi"],
+             fit["r_lo"] * fit["gain"], fit["r_hi"] * fit["gain"]))
     print("-" * 78)
     print("")
     print("     >>>>   N  =  %.3f  +-  %.3f   HG ADC per photoelectron   <<<<"
@@ -515,18 +706,34 @@ def print_fit(fit):
     for i in range(k):
         s = fit["sig"][i]
         flag = ""
+        r = s / fit["gain"] if fit["gain"] else float("nan")
         if fit["amp"][i] < 2.0 * fit["amp_err"][i]:
             flag = "  <- amplitude consistent with zero"
-        elif s <= fit["sigma_lo"] * 1.001:
-            flag = "  <- sigma at the lower bound"
-        elif s >= fit["sigma_hi"] * 0.999:
-            flag = "  <- sigma at the upper bound"
+        elif r <= fit["r_lo"] * 1.001:
+            flag = "  <- sigma/N at the lower bound"
+        elif r >= fit["r_hi"] * 0.999:
+            flag = "  <- sigma/N at the upper bound"
         print("  %-6d %12.2f %8.2f +- %-5.2f %7.2f +- %-5.2f%s"
-              % (i + 1, (i + 1) * fit["gain"], fit["amp"][i],
+              % (fit.get("i0", 1) + i,
+                 fit["ped"] + (fit.get("i0", 1) + i) * fit["gain"],
+                 fit["amp"][i],
                  fit["amp_err"][i], s, fit["sig_err"][i], flag))
     b, be = fit["bkg"], fit["bkg_err"]
-    print("  %-6s p0 = %.4g +- %.3g   p1 = %.4g +- %.3g   p2 = %.4g +- %.3g"
-          % ("bkg", b[0], be[0], b[1], be[1], b[2], be[2]))
+    if fit.get("nobkg"):
+        print("  %-6s none: the polynomial was dropped from the fit "
+              "(--nobkg)" % "bkg")
+    else:
+        print("  %-6s p0 = %.4g +- %.3g   p1 = %.4g +- %.3g   p2 = %.4g +- %.3g"
+              % ("bkg", b[0], be[0], b[1], be[1], b[2], be[2]))
+    if fit.get("bkg_min") is not None and not fit.get("nobkg"):
+        if fit.get("nonneg_bkg"):
+            note = "   (held >= 0)"
+        elif fit["bkg_min"] < 0.0:
+            note = "   <- NEGATIVE; drop --allow-negative-bkg"
+        else:
+            note = "   (came out >= 0 on its own)"
+        print("  %-6s lowest value over the fit range: %.4g%s"
+              % ("", fit["bkg_min"], note))
     print("-" * 78)
     red = fit["chi2"] / fit["ndf"] if fit["ndf"] else float("nan")
     print("  chi2 / ndf = %.2f / %d = %.3f" % (fit["chi2"], fit["ndf"], red))
@@ -561,7 +768,9 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
                dofit=True, npeaks=NPEAKS, sigma_init=SIGMA_INIT,
                sigma_lo=SIGMA_LO, sigma_hi=SIGMA_HI,
                n_init=N_INIT, n_lo=None, n_hi=None,
-               fit_lo=FIT_LO, fit_hi=None):
+               fit_lo=FIT_LO, fit_hi=None, nonneg_bkg=True,
+               sig_frac_lo=SIG_FRAC_LO, sig_frac_hi=SIG_FRAC_HI,
+               ped_peak=False, nobkg=False):
     """One axis: the mean spectrum of the active SiPMs, with the comb fit.
 
     All 50 channels have the same number of entries -- one per event -- so the
@@ -623,14 +832,21 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
         # the mean of nch histograms of Poisson counts
         err = np.sqrt(np.maximum(pooled, 1.0)) / float(nch)
         sel = (centres >= flo) & (centres <= fhi)
-        if sel.sum() < 2 * npeaks + 5:
+        ngauss = npeaks + 1 if ped_peak else npeaks
+        i0 = 0 if ped_peak else 1
+        if sel.sum() < 2 * ngauss + 6:
             fit = {"ok": False, "why": "only %d bins in the fit range %g-%g"
                                        % (int(sel.sum()), flo, fhi)}
         else:
             fit = fit_photon_peaks(centres[sel], mean[sel], err[sel],
-                                   npeaks=npeaks, sigma_init=sigma_init,
+                                   npeaks=ngauss, sigma_init=sigma_init,
                                    sigma_lo=sigma_lo, sigma_hi=sigma_hi,
-                                   n_init=n_init, n_lo=n_lo, n_hi=n_hi)
+                                   n_init=n_init, n_lo=n_lo, n_hi=n_hi,
+                                   nonneg_bkg=nonneg_bkg,
+                                   sig_frac_lo=sig_frac_lo,
+                                   sig_frac_hi=sig_frac_hi,
+                                   ped=max(flo, 0.0) if ped_peak else 0.0,
+                                   i0=i0, nobkg=nobkg)
             if fit.get("ok"):
                 fit["fit_lo"], fit["fit_hi"] = float(flo), float(fhi)
 
@@ -647,13 +863,15 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
         # each peak, sitting on the background it was fitted over
         for i in range(fit["npeaks"]):
             g = fit["amp"][i] * np.exp(
-                -0.5 * ((xf - (i + 1) * gain) / fit["sig"][i]) ** 2)
+                -0.5 * ((xf - (fit["ped"] + (fit.get("i0", 1) + i) * gain))
+                        / fit["sig"][i]) ** 2)
             ax.plot(xf, bkg + g, color="#2a78d6", lw=0.9, ls="--", zorder=5,
                     label="single peaks" if i == 0 else None)
-            ax.axvline((i + 1) * gain, color="#2a78d6", lw=0.7, ls=":",
-                       alpha=0.55, zorder=1)
+            ax.axvline(fit["ped"] + (fit.get("i0", 1) + i) * gain,
+                       color="#2a78d6", lw=0.7, ls=":", alpha=0.55, zorder=1)
             # at the foot of the line, so the labels never fight the legend
-            ax.annotate("%d p.e." % (i + 1), xy=((i + 1) * gain, 0.0),
+            ax.annotate("%d p.e." % (fit.get("i0", 1) + i),
+                        xy=(fit["ped"] + (fit.get("i0", 1) + i) * gain, 0.0),
                         xycoords=("data", "axes fraction"),
                         xytext=(0, 6), textcoords="offset points",
                         ha="center", va="bottom", fontsize=8,
@@ -661,13 +879,16 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
                         bbox=dict(boxstyle="round,pad=0.18", facecolor="white",
                                   edgecolor="none", alpha=0.85))
 
-        ax.plot(xf, bkg, color="0.45", lw=1.1, ls="-.", zorder=5,
-                label="background  p0 + p1 x + p2 x$^2$")
-        ax.plot(xf, peak_model(xf, fit["p"], fit["npeaks"]), color="#cc3311",
+        if not fit.get("nobkg"):
+            ax.plot(xf, bkg, color="0.45", lw=1.1, ls="-.", zorder=5,
+                    label="background  p0 + p1 x + p2 x$^2$")
+        ax.plot(xf, peak_model(xf, fit["p"], fit["npeaks"], fit["ped"],
+                               fit.get("i0", 1)), color="#cc3311",
                 lw=2.0, zorder=6,
-                label="fit: background + %d peaks" % fit["npeaks"])
-        ymax = max(ymax, float(np.max(peak_model(xf, fit["p"],
-                                                 fit["npeaks"]))))
+                label=("fit: %d peaks" if fit.get("nobkg")
+                       else "fit: background + %d peaks") % fit["npeaks"])
+        ymax = max(ymax, float(np.max(peak_model(
+            xf, fit["p"], fit["npeaks"], fit["ped"], fit.get("i0", 1)))))
 
     if show_individual:
         handles = [plt.Line2D([], [], color=COLCOLOUR[c], lw=1.2, alpha=0.6,
@@ -679,8 +900,9 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
             handles.append(plt.Line2D([], [], color="#cc3311", lw=2.0,
                                       label="fit: background + %d peaks"
                                             % fit["npeaks"]))
-            handles.append(plt.Line2D([], [], color="0.45", lw=1.1, ls="-.",
-                                      label="background"))
+            if not fit.get("nobkg"):
+                handles.append(plt.Line2D([], [], color="0.45", lw=1.1,
+                                          ls="-.", label="background"))
             handles.append(plt.Line2D([], [], color="#2a78d6", lw=0.9,
                                       ls="--", label="single peaks"))
         ax.legend(handles=handles, fontsize=8.5, frameon=False,
@@ -799,6 +1021,30 @@ def main(argv=None):
     p.add_argument("--n-max", type=float, default=None,
                    help="upper bound on N (default: xmax / npeaks, so the "
                         "last peak stays inside the range)")
+    p.add_argument("--nobkg", action="store_true",
+                   help="drop the polynomial background: the model becomes the "
+                        "comb alone.  The three coefficients are removed from "
+                        "the fit, not just set to zero, so they cost no "
+                        "degrees of freedom")
+    p.add_argument("--ped-peak", action="store_true",
+                   help="include the 0-avalanche (pedestal) peak in the comb, "
+                        "so the means run P, P+N, P+2N, ... and P floats.  In "
+                        "a dark run the pedestal peak is the tallest, "
+                        "narrowest feature, so it anchors the comb and N comes "
+                        "out as the true SPACING.  Use --fit-xmin 2 with it")
+    p.add_argument("--sigma-max-frac", type=float, default=SIG_FRAC_HI,
+                   help="widest peak allowed, as a fraction of N (default "
+                        "%g).  A peak wider than about half the spacing is "
+                        "not a peak, it is the fit using a Gaussian as "
+                        "background" % SIG_FRAC_HI)
+    p.add_argument("--sigma-min-frac", type=float, default=SIG_FRAC_LO,
+                   help="narrowest peak allowed, as a fraction of N "
+                        "(default %g)" % SIG_FRAC_LO)
+    p.add_argument("--allow-negative-bkg", action="store_true",
+                   help="let the polynomial background go negative.  By "
+                        "default it is fitted in the Bernstein basis of the "
+                        "fit range with non-negative coefficients, which "
+                        "keeps it >= 0 everywhere it is used")
     p.add_argument("--no-pdf", action="store_true",
                    help="only write the pngs, not the matching pdfs")
     args = p.parse_args(argv)
@@ -921,7 +1167,11 @@ def main(argv=None):
             sigma_hi=args.sigma_max,
             n_init=(args.n_init if args.n_init and args.n_init > 0 else None),
             n_lo=args.n_min, n_hi=args.n_max,
-            fit_lo=args.fit_xmin, fit_hi=args.fit_xmax)
+            fit_lo=args.fit_xmin, fit_hi=args.fit_xmax,
+            nonneg_bkg=not args.allow_negative_bkg,
+            sig_frac_lo=args.sigma_min_frac,
+            sig_frac_hi=args.sigma_max_frac, ped_peak=args.ped_peak,
+            nobkg=args.nobkg)
         print("all50      %d SiPMs, %d entries pooled (%d per SiPM)"
               % (nch, nent, nent // nch if nch else 0))
         if not args.logy:
