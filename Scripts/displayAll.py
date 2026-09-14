@@ -171,7 +171,7 @@ def save_event_plot(event, trgid, gain, run_label, output_dir):
 
     finite = image[np.isfinite(image)]
     vmin = 0.0
-    vmax = max(1.0, float(np.max(finite))) if finite.size else 1.0
+    vmax = 1000.0 if gain == "LG" else 4000.0
     norm = Normalize(vmin=vmin, vmax=vmax)
 
     cmap = plt.get_cmap("plasma").copy()
