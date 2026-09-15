@@ -51,9 +51,10 @@ array.
 
 Selection
 ---------
-    0.  --requireTrigger (optional): at least 2 of the six CosmicWatch
-        channels ch0-ch5 fired, a channel counting as fired when its RAW
-        HG > 1000 OR its RAW LG > 500.  Same criterion as
+    0.  --requireTrigger (optional): ALL FOUR of ch2, ch3, ch4, ch5 (CWA,
+        CWB, CWC, CWD) fired, a channel counting as fired when its RAW
+        HG > 1000 OR its RAW LG > 500.  ch0 and ch1 (CW top, CW bottom) are
+        measured and reported but do not gate the event.  Same criterion as
         makeEventDisplays.py --requireTrigger.  Applied first, so the photon
         fractions below are then quoted among the events that fired, and
         '_requireTrigger' is added to the output file name.
@@ -61,9 +62,14 @@ Selection
     2.  the column with the most photons (summed over the 4 SiPMs in it) is
         not one of the first two (0, 1) or the last two (9, 10)
 
-Every fraction is reported, along with how many of the six paddles fired per
-event whether or not the cut is on.  The first few events are printed in full so the
-ring ordering and the conversion can be checked by eye.
+Every fraction is reported.  A four-fold AND is only as good as its worst
+paddle -- one channel that stops firing takes the whole sample to zero -- so
+the per-channel fire rate is always printed, cut on or not, and a required
+channel that never fires is called out by name.  --trig-channels and
+--trig-nmin change which channels are required and how many of them.
+
+The first few events are printed in full so the ring ordering and the
+conversion can be checked by eye.
 """
 
 import argparse
@@ -86,13 +92,17 @@ NEDGE = 2                        # columns barred at each end for the max
 NPRINT = 5
 REPORT_EVERY = 250000
 
-# --requireTrigger: the six CosmicWatch paddles.  A channel counts as fired
-# when raw HG > TRIG_HG_MIN or raw LG > TRIG_LG_MIN, and the event is kept
-# when at least TRIG_NMIN of the six fired.  Same criterion as
-# makeEventDisplays.py --requireTrigger.
+# --requireTrigger.  A channel counts as fired when raw HG > TRIG_HG_MIN or
+# raw LG > TRIG_LG_MIN, and the event is kept when ALL of TRIG_REQUIRED fired.
+# Same criterion as makeEventDisplays.py --requireTrigger.
+#
+# The required set is ch2-5 (CWA, CWB, CWC, CWD) -- a four-fold AND.  ch0 and
+# ch1 (CW top, CW bottom) are still measured and reported, they just do not
+# gate the event.  An AND of four is fragile: one dead paddle takes the whole
+# sample to zero, which is why the per-channel fire rate is printed.
 TRIG_HG_MIN = 1000.0
 TRIG_LG_MIN = 500.0
-TRIG_NMIN = 2
+TRIG_REQUIRED = (2, 3, 4, 5)     # all of these must fire
 
 
 # ----------------------------------------------------------------------------
@@ -249,7 +259,7 @@ def evaluate(img, min_photons, nedge):
 
 
 def show_event(n, trgid, img, res, nsat, min_photons, nedge,
-               fired=None, nmin=TRIG_NMIN):
+               fired=None, required=TRIG_REQUIRED, nmin=None):
     v1 = "PASS" if res["pass1"] else "fail"
     v2 = "PASS" if res["pass2"] else "fail"
     why = ""
@@ -262,11 +272,20 @@ def show_event(n, trgid, img, res, nsat, min_photons, nedge,
           "%s%s" % (n, trgid, res["total"], v1, min_photons, res["imax"],
                     v2, why))
     if fired is not None:
-        print("              trigger %d/6 fired%s   %s"
-              % (len(fired),
-                 " [%s]" % ", ".join("ch%d %s" % (c, TRIG_NAME[c])
-                                     for c in fired) if fired else "",
-                 "PASS" if len(fired) >= nmin else "fail (need %d)" % nmin))
+        need = len(required) if nmin is None else nmin
+        nreq = sum(1 for c in required if c in fired)
+        missing = [c for c in required if c not in fired]
+        print("              trigger %d/%d of the required %s fired%s   %s"
+              % (nreq, len(required),
+                 ",".join("ch%d" % c for c in required),
+                 "   [also %s]" % ", ".join("ch%d %s" % (c, TRIG_NAME[c])
+                                            for c in fired
+                                            if c not in required)
+                 if any(c not in required for c in fired) else "",
+                 "PASS" if nreq >= need
+                 else "fail (missing %s)"
+                      % ",".join("ch%d %s" % (c, TRIG_NAME[c])
+                                 for c in missing)))
     if nsat:
         print("              %d channel(s) above HG %g -> LG * %g used there"
               % (nsat, HG_SAT, LG_SCALE))
@@ -314,21 +333,27 @@ def main(argv=None):
                    help="selection 2: bar the max-photon column from the "
                         "first N and last N columns (default %d)" % NEDGE)
     p.add_argument("--requireTrigger", action="store_true",
-                   help="also require at least %d of the six CosmicWatch "
-                        "channels ch0-ch5 to have fired, where fired means "
-                        "raw HG > %g OR raw LG > %g -- the same criterion as "
-                        "makeEventDisplays.py.  '_requireTrigger' is added to "
-                        "the default output file name"
-                        % (TRIG_NMIN, TRIG_HG_MIN, TRIG_LG_MIN))
+                   help="also require ALL of %s to have fired, where fired "
+                        "means raw HG > %g OR raw LG > %g -- the same "
+                        "criterion as makeEventDisplays.py.  "
+                        "'_requireTrigger' is added to the default output "
+                        "file name"
+                        % (",".join("ch%d" % c for c in TRIG_REQUIRED),
+                           TRIG_HG_MIN, TRIG_LG_MIN))
     p.add_argument("--trig-hg", type=float, default=TRIG_HG_MIN,
                    help="raw HG above which a trigger channel counts as "
                         "fired (default %g)" % TRIG_HG_MIN)
     p.add_argument("--trig-lg", type=float, default=TRIG_LG_MIN,
                    help="raw LG above which a trigger channel counts as "
                         "fired (default %g)" % TRIG_LG_MIN)
-    p.add_argument("--trig-nmin", type=int, default=TRIG_NMIN,
-                   help="how many of the 6 trigger channels must fire "
-                        "(default %d)" % TRIG_NMIN)
+    p.add_argument("--trig-channels", default=None, metavar="LIST",
+                   help="comma-separated channels that must fire (default "
+                        "%s).  The channel assignment has moved once already "
+                        "in this detector, so it is worth being explicit."
+                        % ",".join(str(c) for c in TRIG_REQUIRED))
+    p.add_argument("--trig-nmin", type=int, default=None, metavar="N",
+                   help="require only N of the channels above instead of all "
+                        "of them (default: all %d)" % len(TRIG_REQUIRED))
     p.add_argument("--placeholder", action="store_true",
                    help="also write a 4 x %d block of -999999 before the "
                         "counts, in the slot the MC files use for the "
@@ -375,10 +400,29 @@ def main(argv=None):
     print("format     TrgID line%s, then 4 x %d counts"
           % (", 4 x %d placeholder block" % NRING if args.placeholder else "",
              NRING))
+    # which channels gate the event, and how many of them are needed
+    if args.trig_channels:
+        try:
+            required = tuple(int(v) for v in args.trig_channels.replace(",", " ").split())
+        except ValueError:
+            sys.exit("--trig-channels %r is not a list of integers"
+                     % args.trig_channels)
+        if not required or any(not 0 <= c < NCH for c in required):
+            sys.exit("--trig-channels must name channels in 0..%d" % (NCH - 1))
+    else:
+        required = TRIG_REQUIRED
+    need = len(required) if args.trig_nmin is None else args.trig_nmin
+    if not 1 <= need <= len(required):
+        sys.exit("--trig-nmin %d makes no sense for %d channels"
+                 % (need, len(required)))
+
     if args.requireTrigger:
-        print("trigger    --requireTrigger ON: >= %d of ch0-ch5 fired, where "
+        print("trigger    --requireTrigger ON: %s of %s fired, where "
               "fired = raw HG > %g OR raw LG > %g"
-              % (args.trig_nmin, args.trig_hg, args.trig_lg))
+              % ("ALL %d" % need if need == len(required) else ">= %d" % need,
+                 ",".join("ch%d (%s)" % (c, TRIG_NAME.get(c, "?"))
+                          for c in required),
+                 args.trig_hg, args.trig_lg))
     if args.no_select:
         print("selection  NONE (--no-select)%s"
               % ("   -- the trigger cut still applies"
@@ -390,7 +434,10 @@ def main(argv=None):
     print("=" * 78)
 
     n = nt = n1 = n12 = nsat_tot = 0
-    nfired_hist = [0] * (len(TRIG_CH) + 1)
+    nfired_hist = [0] * (len(required) + 1)     # among the REQUIRED channels
+    # per-channel fire counts over all six, so a dead paddle is obvious: an
+    # AND of four goes to zero if any one of them stops firing
+    chan_fired = {c: 0 for c in TRIG_CH}
     t0 = time.time()
     ph_line = " ".join(["-999999"] * NRING)
 
@@ -403,9 +450,12 @@ def main(argv=None):
 
             fired = fired_trigger_channels(hg, lg, args.trig_hg,
                                            args.trig_lg)
-            nfired_hist[len(fired)] += 1
-            trig_ok = (not args.requireTrigger) \
-                or len(fired) >= args.trig_nmin
+            for c in fired:
+                if c in chan_fired:
+                    chan_fired[c] += 1
+            nreq = sum(1 for c in required if c in fired)
+            nfired_hist[nreq] += 1
+            trig_ok = (not args.requireTrigger) or nreq >= need
 
             img, nsat = make_image(hg, lg, args.adc_per_photon,
                                    args.lg_scale, args.hg_sat)
@@ -416,7 +466,7 @@ def main(argv=None):
                 show_event(n - 1, trgid, img, res, nsat, args.min_photons,
                            args.edge,
                            fired if args.requireTrigger else None,
-                           args.trig_nmin)
+                           required, need)
 
             # the trigger cut comes first: it is a property of the event, not
             # of the image, so the photon fractions below are quoted among
@@ -459,8 +509,10 @@ def main(argv=None):
     print("=" * 78)
     print("  events read                         %8d" % n)
     if args.requireTrigger:
-        print("  pass --requireTrigger (>= %d of 6)   %8d    fraction of all "
-              "= %s" % (args.trig_nmin, nt, frac(nt, n)))
+        print("  pass --requireTrigger (%s of %d)%s %8d    fraction of all "
+              "= %s"
+              % ("all" if need == len(required) else ">= %d" % need,
+                 len(required), " " * 5, nt, frac(nt, n)))
     print("  pass 1 (>= %d photons)            %8d    fraction of %-9s "
           "= %s" % (args.min_photons, n1,
                     "triggered" if args.requireTrigger else "all",
@@ -470,9 +522,21 @@ def main(argv=None):
     print("  %-34s  %8d    fraction of all   = %s"
           % ("written to the output", nwritten, frac(nwritten, n)))
     print("-" * 78)
-    print("  trigger channels fired per event: %s"
-          % "  ".join("%d->%d" % (i, v)
-                      for i, v in enumerate(nfired_hist) if v))
+    print("  of the required %s, this many fired per event: %s"
+          % (",".join("ch%d" % c for c in required),
+             "  ".join("%d->%d" % (i, v)
+                       for i, v in enumerate(nfired_hist) if v)))
+    print("  per-channel fire rate (a dead paddle zeroes an AND):")
+    for c in TRIG_CH:
+        print("     ch%-2d %-10s %8d  %6.2f %%%s"
+              % (c, TRIG_NAME.get(c, ""), chan_fired[c],
+                 100.0 * chan_fired[c] / max(n, 1),
+                 "   <- required" if c in required else ""))
+    dead = [c for c in required if chan_fired[c] == 0]
+    if dead:
+        print("     WARNING  %s never fired, so an AND over the required set "
+              "can never pass."
+              % ", ".join("ch%d" % c for c in dead))
     print("  %d channel(s) over HG %g in total took the LG * %g branch"
           % (nsat_tot, args.hg_sat, args.lg_scale))
     print("  %.1f s" % dt)
