@@ -11,8 +11,18 @@ Per channel and event:
     signal = HGcorr                       normally
            = LGcorr * LGscale             when HG is saturated
 
-The pedestal file and the LG scale file are hardcoded below.  Everything read
-from them is echoed to the screen before any plotting.
+Calibration: both OFF by default
+--------------------------------
+--noPedestal   (DEFAULT) do not read the pedestal/noise file at all and take
+               every pedestal to be 0, so signal = raw HG.  --usePedestal
+               turns the file back on.
+--constantLG   (DEFAULT) do not read the LG scale file at all and use
+               LGscale = 10 for every channel (--lg-const changes the value).
+               --fitLG turns the file back on.
+
+So out of the box the script needs nothing but the list file.  Give
+--usePedestal / --fitLG to bring the calibration files back in; everything
+read from them is echoed to the screen before any plotting, as before.
 
 Usage
 -----
@@ -24,12 +34,17 @@ is divided by the sum over the 58 cells of the image, the colour scale runs
 the lower left shows the total that was divided out, on a fixed axis so the
 bars are comparable between events.
 
---requireTrigger keeps only the events in which BOTH CosmicWatch channels
-fired -- raw HG above TRIG_HG_MIN on each of TRIG_CH -- and draws the first -n
-of those.  The whole file is read in that case, because how far in the first
--n passing events lie is not known in advance.  Event numbers in the file
-names stay the original ones, so a gap in the numbering is the events the cut
-removed.
+--requireTrigger keeps only the events in which at least TRIG_NMIN (2) of the
+six CosmicWatch channels ch0-ch5 fired, a channel counting as fired when its
+RAW HG > TRIG_HG_MIN (1000) OR its RAW LG > TRIG_LG_MIN (500).  Raw, not
+pedestal subtracted: the threshold is a discriminator level on the number the
+board actually wrote down.  The LG arm is there so a channel whose HG has
+saturated or been clipped still counts.
+
+The first -n passing events are drawn.  The whole file is read in that case,
+because how far in the first -n passing events lie is not known in advance.
+Event numbers in the file names stay the original ones, so a gap in the
+numbering is the events the cut removed.
 
 Output
 ------
@@ -71,10 +86,17 @@ HG_SAT = 4000.0     # raw HG at or above this counts as saturated
 LG_SAT = 4000.0     # raw LG at or above this: even the LG branch is saturated
 NEVENTS = 100       # events drawn by default
 
-# --requireTrigger: the two CosmicWatch channels, and the raw HG each of them
-# has to exceed for the event to be drawn
-TRIG_CH = (0, 1)            # ch0 = CW top, ch1 = CW bottom
+# --requireTrigger: the six CosmicWatch channels.  A channel counts as fired
+# when raw HG > TRIG_HG_MIN or raw LG > TRIG_LG_MIN, and the event is kept
+# when at least TRIG_NMIN of the six fired.
+TRIG_CH = (0, 1, 2, 3, 4, 5)   # ch0 CW top, ch1 CW bottom, ch2-5 CWA-CWD
 TRIG_HG_MIN = 1000.0
+TRIG_LG_MIN = 500.0
+TRIG_NMIN = 2
+
+# --constantLG: the scale used for every channel when the LG scale file is not
+# read, which is the default
+LG_CONST = 10.0
 
 # --normalize: the vertical bar at the lower left runs 0 .. TOTAL_MAX ADC.
 # 250000 is the round number for Run126 -- its per-event sums over the 58
@@ -119,20 +141,31 @@ GRID_CH = [ch for ch, (_n, _c, _r) in sorted(CHMAP.items())
            if _c is not None and ch not in UNCONNECTED]
 
 
-def passes_trigger(ev, chans=TRIG_CH, hgmin=TRIG_HG_MIN):
-    """True when every trigger channel has raw HG strictly above hgmin.
+def fired_trigger_channels(ev, chans=TRIG_CH, hgmin=TRIG_HG_MIN,
+                           lgmin=TRIG_LG_MIN):
+    """Which of the trigger channels fired, as a list of channel numbers.
 
-    Raw HG, not pedestal subtracted: the threshold is a discriminator level on
-    the number the board actually wrote down.
+    A channel fires when its RAW HG is strictly above hgmin OR its RAW LG is
+    strictly above lgmin.  Raw, not pedestal subtracted: the threshold is a
+    discriminator level on the number the board actually wrote down.  The LG
+    arm catches a channel whose HG has saturated or been clipped, which would
+    otherwise fail an HG-only cut.
     """
-    hg = ev["hg"]
+    hg, lg = ev["hg"], ev["lg"]
+    out = []
     for c in chans:
         if not 0 <= c < NCH:
-            return False
-        v = hg[c]
-        if not np.isfinite(v) or not v > hgmin:
-            return False
-    return True
+            continue
+        h, l = hg[c], lg[c]
+        if (np.isfinite(h) and h > hgmin) or (np.isfinite(l) and l > lgmin):
+            out.append(c)
+    return out
+
+
+def passes_trigger(ev, chans=TRIG_CH, hgmin=TRIG_HG_MIN, lgmin=TRIG_LG_MIN,
+                   nmin=TRIG_NMIN):
+    """True when at least nmin of the trigger channels fired."""
+    return len(fired_trigger_channels(ev, chans, hgmin, lgmin)) >= nmin
 
 
 def grid_total(sig):
@@ -209,6 +242,28 @@ def read_pedestals(path):
     return v, comments
 
 
+def zero_pedestals():
+    """--noPedestal: every pedestal 0, nothing read from disk.
+
+    Same shape as read_pedestals() returns, so nothing downstream changes.
+    The noise columns stay NaN because there is no measurement of them here;
+    they are only ever printed.
+    """
+    v = {"hg_ped": np.zeros(NCH), "hg_rms": np.full(NCH, np.nan),
+         "lg_ped": np.zeros(NCH), "lg_rms": np.full(NCH, np.nan),
+         "name": [None] * NCH}
+    return v, ["--noPedestal: no file read, HG_ped = LG_ped = 0 for all "
+               "%d channels, so signal = raw HG" % NCH]
+
+
+def constant_lgscale(value=LG_CONST):
+    """--constantLG: one scale for every channel, nothing read from disk."""
+    sc = {"k": np.full(NCH, float(value)), "c": np.zeros(NCH),
+          "n": np.zeros(NCH, dtype=int), "column": "constant"}
+    return sc, ["--constantLG: no file read, LGscale = %g for all %d channels"
+                % (value, NCH)]
+
+
 def read_lgscale(path, column="k"):
     """calculateLGScale.py output -> 64-length arrays of the scale and offset.
 
@@ -250,11 +305,17 @@ def print_inputs(ped_path, ped, ped_comments,
                  sc_path, sc, sc_comments, kfill):
     """Echo both calibration files and every number taken from them."""
     print("=" * 92)
-    print("PedestalAndNoiseFile = %s" % ped_path)
-    print("  (absolute: %s)" % os.path.abspath(ped_path))
-    print("LGScaleFactor        = %s   [using column '%s']"
-          % (sc_path, sc["column"]))
-    print("  (absolute: %s)" % os.path.abspath(sc_path))
+    if ped_path is None:
+        print("PedestalAndNoiseFile = (not read -- --noPedestal)")
+    else:
+        print("PedestalAndNoiseFile = %s" % ped_path)
+        print("  (absolute: %s)" % os.path.abspath(ped_path))
+    if sc_path is None:
+        print("LGScaleFactor        = (not read -- --constantLG)")
+    else:
+        print("LGScaleFactor        = %s   [using column '%s']"
+              % (sc_path, sc["column"]))
+        print("  (absolute: %s)" % os.path.abspath(sc_path))
     print("-" * 92)
     for c in ped_comments:
         print("  ped | %s" % c)
@@ -274,15 +335,27 @@ def print_inputs(ped_path, ped, ped_comments,
             ks, note = "%11.4f" % sc["k"][c], ""
         else:
             ks, note = "%11.4f" % kfill, "filled"
-        print("  %4d %10s %11.4f %11.4f %11.4f %11.4f %s %8d %8s"
-              % (c, nm, ped["hg_ped"][c], ped["hg_rms"][c],
-                 ped["lg_ped"][c], ped["lg_rms"][c], ks, sc["n"][c], note))
+
+        def _n(v):
+            return "%11.4f" % v if np.isfinite(v) else "%11s" % "-"
+
+        print("  %4d %10s %s %s %s %s %s %8d %8s"
+              % (c, nm, _n(ped["hg_ped"][c]), _n(ped["hg_rms"][c]),
+                 _n(ped["lg_ped"][c]), _n(ped["lg_rms"][c]), ks,
+                 sc["n"][c], note))
     nfit = int(np.isfinite(sc["k"]).sum())
     print("-" * 92)
-    print("  pedestals for %d/%d channels, LG scale fitted for %d/%d "
-          "(median %.4f; unfitted channels use %.4f)"
-          % (int(np.isfinite(ped["hg_ped"]).sum()), NCH, nfit, NCH,
-             np.nanmedian(sc["k"]), kfill))
+    if ped_path is None:
+        print("  pedestals: none subtracted (--noPedestal)")
+    else:
+        print("  pedestals for %d/%d channels"
+              % (int(np.isfinite(ped["hg_ped"]).sum()), NCH))
+    if sc_path is None:
+        print("  LG scale : constant %.4f for all %d channels (--constantLG)"
+              % (kfill, NCH))
+    else:
+        print("  LG scale fitted for %d/%d (median %.4f; unfitted channels "
+              "use %.4f)" % (nfit, NCH, np.nanmedian(sc["k"]), kfill))
     print("=" * 92)
 
 
@@ -410,7 +483,8 @@ def _text_colour(rgba):
 
 def draw_event(sig, sat, both, out_png, title, subtitle,
                vmin, vmax, cmap_name="inferno", logscale=False,
-               normalize=False, total=None, total_max=None, pct_max=None):
+               normalize=False, total=None, total_max=None, pct_max=None,
+               ped_subtracted=True):
     """4 columns A-D, rows 0-15 bottom to top, CW strips above and below.
 
     With normalize=True every value is divided by `total`, the sum over the
@@ -540,7 +614,9 @@ def draw_event(sig, sat, both, out_png, title, subtitle,
                      .tick_values(0.0, vmax))
         cb.ax.set_ylim(0, vmax)
     else:
-        cb.set_label("signal [HG ADC, pedestal subtracted]", fontsize=7)
+        cb.set_label("signal [HG ADC, %s]"
+                     % ("pedestal subtracted" if ped_subtracted
+                        else "raw, no pedestal"), fontsize=7)
     cb.ax.tick_params(labelsize=6)
 
     # ---- the total that everything above was divided by ----
@@ -594,11 +670,39 @@ def main(argv=None):
     p.add_argument("listfile", help="Janus list text file")
     p.add_argument("-n", "--nevents", type=int, default=NEVENTS,
                    help="number of events to draw (default %d)" % NEVENTS)
+    ped_grp = p.add_mutually_exclusive_group()
+    ped_grp.add_argument("--noPedestal", dest="use_pedestal",
+                         action="store_false",
+                         help="DEFAULT.  Do not read the pedestal/noise file "
+                              "and do not subtract pedestals: every pedestal "
+                              "is 0, so signal = raw HG")
+    ped_grp.add_argument("--usePedestal", dest="use_pedestal",
+                         action="store_true",
+                         help="read the pedestal/noise file (--ped) and "
+                              "subtract pedestals, as the script used to do "
+                              "unconditionally")
+    p.set_defaults(use_pedestal=False)
+
+    lg_grp = p.add_mutually_exclusive_group()
+    lg_grp.add_argument("--constantLG", dest="fit_lg", action="store_false",
+                        help="DEFAULT.  Do not read the LG scale file; use "
+                             "LGscale = %g (--lg-const) for every channel"
+                             % LG_CONST)
+    lg_grp.add_argument("--fitLG", dest="fit_lg", action="store_true",
+                        help="read the fitted per-channel LG scale file "
+                             "(--scale), as the script used to do "
+                             "unconditionally")
+    p.set_defaults(fit_lg=False)
+
+    p.add_argument("--lg-const", type=float, default=LG_CONST,
+                   help="the LG scale used for every channel under "
+                        "--constantLG (default %g)" % LG_CONST)
     p.add_argument("--ped", default=PedestalAndNoiseFile,
-                   help="pedestal/noise file (default: %s)"
-                        % PedestalAndNoiseFile)
+                   help="pedestal/noise file, read only with --usePedestal "
+                        "(default: %s)" % PedestalAndNoiseFile)
     p.add_argument("--scale", default=LGScaleFactor,
-                   help="LG scale file (default: %s)" % LGScaleFactor)
+                   help="LG scale file, read only with --fitLG (default: %s)"
+                        % LGScaleFactor)
     p.add_argument("--scale-col", default="k",
                    choices=["k", "k_gm", "k_orig"],
                    help="which slope column of the LG scale file to use "
@@ -610,12 +714,23 @@ def main(argv=None):
                    help="raw HG at or above this is saturated (default %g)"
                         % HG_SAT)
     p.add_argument("--requireTrigger", action="store_true",
-                   help="only draw events in which both CosmicWatch channels "
-                        "fired: raw HG > %g on ch%d (%s) and ch%d (%s).  The "
-                        "whole file is read so that -n counts events that PASS "
-                        "the cut"
-                        % (TRIG_HG_MIN, TRIG_CH[0], CHMAP[TRIG_CH[0]][0],
-                           TRIG_CH[1], CHMAP[TRIG_CH[1]][0]))
+                   help="only draw events in which at least %d of the six "
+                        "CosmicWatch channels %s fired, a channel counting as "
+                        "fired when raw HG > %g OR raw LG > %g.  The whole "
+                        "file is read so that -n counts events that PASS the "
+                        "cut"
+                        % (TRIG_NMIN,
+                           ",".join("ch%d" % c for c in TRIG_CH),
+                           TRIG_HG_MIN, TRIG_LG_MIN))
+    p.add_argument("--trig-hg", type=float, default=TRIG_HG_MIN,
+                   help="raw HG above which a trigger channel counts as "
+                        "fired (default %g)" % TRIG_HG_MIN)
+    p.add_argument("--trig-lg", type=float, default=TRIG_LG_MIN,
+                   help="raw LG above which a trigger channel counts as "
+                        "fired (default %g)" % TRIG_LG_MIN)
+    p.add_argument("--trig-nmin", type=int, default=TRIG_NMIN,
+                   help="how many of the %d trigger channels must fire "
+                        "(default %d)" % (len(TRIG_CH), TRIG_NMIN))
     p.add_argument("--skip-events", type=int, default=1,
                    help="drop this many events from the start of the run "
                         "(default 1: event 0 is a start-of-run artifact)")
@@ -650,17 +765,33 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     src = args.listfile
-    for f, what in ((src, "list file"), (args.ped, "pedestal file"),
-                    (args.scale, "LG scale file")):
+    needed = [(src, "list file")]
+    if args.use_pedestal:
+        needed.append((args.ped, "pedestal file"))
+    if args.fit_lg:
+        needed.append((args.scale, "LG scale file"))
+    for f, what in needed:
         if not os.path.exists(f):
             sys.exit("no such %s: %s" % (what, f))
 
     # ---- calibration inputs ----
-    ped, ped_comments = read_pedestals(args.ped)
-    sc, sc_comments = read_lgscale(args.scale, args.scale_col)
+    # both are OFF by default: --usePedestal / --fitLG bring the files back
+    if args.use_pedestal:
+        ped, ped_comments = read_pedestals(args.ped)
+        ped_path = args.ped
+    else:
+        ped, ped_comments = zero_pedestals()
+        ped_path = None
+
+    if args.fit_lg:
+        sc, sc_comments = read_lgscale(args.scale, args.scale_col)
+        sc_path = args.scale
+    else:
+        sc, sc_comments = constant_lgscale(args.lg_const)
+        sc_path = None
+
     kfill = float(np.nanmedian(sc["k"]))
-    print_inputs(args.ped, ped, ped_comments, args.scale, sc, sc_comments,
-                 kfill)
+    print_inputs(ped_path, ped, ped_comments, sc_path, sc, sc_comments, kfill)
 
     k = np.where(np.isfinite(sc["k"]), sc["k"], kfill)
     cfit = np.where(np.isfinite(sc["c"]), sc["c"], 0.0)
@@ -675,13 +806,26 @@ def main(argv=None):
         sys.exit("no events to draw from %s" % src)
     ntrig_seen = len(events)
     ntrig_pass = ntrig_seen
+    nfired_hist = np.zeros(len(TRIG_CH) + 1, dtype=int)
     if args.requireTrigger:
-        events = [ev for ev in events if passes_trigger(ev)]
+        kept = []
+        for ev in events:
+            nf = len(fired_trigger_channels(ev, TRIG_CH, args.trig_hg,
+                                            args.trig_lg))
+            nfired_hist[min(nf, len(TRIG_CH))] += 1
+            if nf >= args.trig_nmin:
+                kept.append(ev)
+        events = kept
         ntrig_pass = len(events)
         if not events:
-            sys.exit("no events in %s pass --requireTrigger "
-                     "(raw HG > %g on ch%d and ch%d); %d events tested"
-                     % (src, TRIG_HG_MIN, TRIG_CH[0], TRIG_CH[1], ntrig_seen))
+            sys.exit("no events in %s pass --requireTrigger (>= %d of %s with "
+                     "raw HG > %g or raw LG > %g); %d events tested, "
+                     "n fired = %s"
+                     % (src, args.trig_nmin,
+                        ",".join("ch%d" % c for c in TRIG_CH),
+                        args.trig_hg, args.trig_lg, ntrig_seen,
+                        " ".join("%d:%d" % (i, n)
+                                 for i, n in enumerate(nfired_hist) if n)))
     events = events[:args.nevents]
 
     tag = run_tag(src)
@@ -718,19 +862,26 @@ def main(argv=None):
     print("run file   %s" % src)
     print("events     %d drawn (first %d skipped), %d channels each"
           % (len(events), args.skip_events, NCH))
-    print("signal     HG - HG_ped, or (LG - LG_ped) * %s%s when raw HG >= %g"
-          % (args.scale_col, " + c" if args.use_intercept else "",
-             args.hg_sat))
+    print("signal     %s, or %s * %s%s when raw HG >= %g"
+          % ("raw HG (no pedestal)" if not args.use_pedestal
+             else "HG - HG_ped",
+             "raw LG" if not args.use_pedestal else "(LG - LG_ped)",
+             "%g (constant)" % args.lg_const if not args.fit_lg
+             else args.scale_col,
+             " + c" if args.use_intercept else "", args.hg_sat))
     if args.requireTrigger:
-        print("trigger    --requireTrigger ON: raw HG > %g on ch%d (%s) and "
-              "ch%d (%s)"
-              % (TRIG_HG_MIN, TRIG_CH[0], CHMAP[TRIG_CH[0]][0],
-                 TRIG_CH[1], CHMAP[TRIG_CH[1]][0]))
+        print("trigger    --requireTrigger ON: >= %d of %s fired, where fired "
+              "= raw HG > %g OR raw LG > %g"
+              % (args.trig_nmin, ",".join("ch%d" % c for c in TRIG_CH),
+                 args.trig_hg, args.trig_lg))
         print("           %d of %d events pass (%.2f %%); the first %d are "
               "drawn"
               % (ntrig_pass, ntrig_seen,
                  100.0 * ntrig_pass / ntrig_seen if ntrig_seen else 0.0,
                  len(events)))
+        print("           channels fired per event: %s"
+              % "  ".join("%d->%d" % (i, n)
+                          for i, n in enumerate(nfired_hist) if n))
     if args.normalize:
         print("normalize  ON: each cell / (sum over the %d image cells) * 100"
               % len(GRID_CH))
@@ -787,7 +938,8 @@ def main(argv=None):
         draw_event(s, sa, bo, out_png, title, sub,
                    args.zmin, vmax, cmap_name=args.cmap, logscale=args.log,
                    normalize=args.normalize, total=tot_cells,
-                   total_max=total_max, pct_max=args.zmax)
+                   total_max=total_max, pct_max=args.zmax,
+                   ped_subtracted=args.use_pedestal)
 
     print("wrote %d png files to %s" % (len(events), outdir))
     print("  %d saturated HG channels in total were replaced by LG * scale"
