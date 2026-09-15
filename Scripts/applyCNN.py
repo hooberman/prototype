@@ -189,13 +189,42 @@ def circ_stats(phi_deg):
     return np.degrees(np.arctan2(s, c)) % 360.0, float(np.hypot(s, c))
 
 
+def cos_power_curve(x_deg, tmax, n_in, binw_deg, power=2.0):
+    """Expected muons per bin for a flux isotropic in phi and ~cos^p(theta).
+
+    The point of the sin(theta) factor: the flux per unit SOLID ANGLE goes as
+    cos^p(theta), but a zenith-angle histogram counts muons per unit THETA,
+    and the ring of directions at theta is 2 pi sin(theta) wide.  There are
+    simply more directions on the sky at 30 degrees than at 0, and a raw
+    cos^p curve drawn straight onto a theta histogram ignores that -- it
+    would peak at 0 where the data must go to zero.
+
+        dN/dtheta  ~  cos^p(theta) sin(theta)
+
+    Normalised so the curve's area equals the n_in events inside [0, tmax]:
+
+        integral of cos^p sin dtheta from 0 to T  =  (1 - cos^(p+1) T)/(p+1)
+    """
+    t = np.radians(np.asarray(x_deg, dtype=float))
+    T = np.radians(float(tmax))
+    norm = (1.0 - np.cos(T) ** (power + 1.0)) / (power + 1.0)
+    if norm <= 0:
+        return np.zeros_like(t)
+    pdf_per_deg = (np.cos(t) ** power) * np.sin(t) * (np.pi / 180.0) / norm
+    return n_in * binw_deg * pdf_per_deg
+
+
 def make_page(theta, phi, conf, out_paths, title, subtitle,
               nth=45, nph=36, style="auto", solid_angle=False,
-              theta_max=None):
+              theta_max=None, radio_dphi=10.0, radio_dtheta=5.0,
+              cos_power=2.0, show_cos=True):
     """One page: theta spectrum, phi spectrum, and the circular radiograph."""
     n = theta.size
     tmax = theta_max if theta_max else float(
         min(90.0, max(10.0, np.percentile(theta, 99.5) * 1.05)))
+    # round up to a whole number of radiograph theta bins, so the rim lands on
+    # a bin edge and the radial ticks come out on round numbers
+    tmax = float(radio_dtheta * np.ceil(tmax / radio_dtheta))
 
     # explicit axes rather than a gridspec: the radiograph has to stay round
     # and large, and the two spectra have to clear the header
@@ -211,17 +240,26 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
               color="#2a78d6", alpha=0.25)
     ax_t.hist(theta, bins=np.linspace(0, tmax, nth + 1), histtype="step",
               color="#1b4f8f", lw=1.8)
+    # the expected shape for an isotropic-in-phi, cos^p flux, area-matched to
+    # the events inside the plotted range
+    if show_cos:
+        binw = tmax / float(nth)
+        n_in = int(np.sum((theta >= 0) & (theta <= tmax)))
+        xc = np.linspace(0, tmax, 400)
+        yc = cos_power_curve(xc, tmax, n_in, binw, cos_power)
+        ax_t.plot(xc, yc, color="0.35", ls="--", lw=1.0, zorder=4)
+        lab = (r"$\cos^{%g}\theta\,\sin\theta$" % cos_power) \
+            if cos_power != 2.0 else r"$\cos^{2}\theta\,\sin\theta$"
+        k = int(0.72 * xc.size)
+        ax_t.annotate(lab, xy=(xc[k], yc[k]), xytext=(4, 7),
+                      textcoords="offset points", ha="left", va="bottom",
+                      fontsize=8.5, color="0.35")
+
     ax_t.set_xlabel(r"$\theta$ [degrees]", fontsize=11)
     ax_t.set_ylabel("muons / bin", fontsize=11)
     ax_t.set_title(r"zenith angle $\theta$", fontsize=12)
     ax_t.grid(alpha=0.25, lw=0.5)
     ax_t.set_xlim(0, tmax)
-    ax_t.legend([plt.Line2D([], [], color="none")],
-                ["N = %d\nmean %.1f$^\\circ$\nmedian %.1f$^\\circ$\n"
-                 "RMS %.1f$^\\circ$"
-                 % (n, theta.mean(), np.median(theta), theta.std())],
-                loc="upper right", fontsize=8.5, frameon=True, framealpha=0.9,
-                handlelength=0, handletextpad=0)
 
     # ---- 2. phi ----
     ax_p.hist(phi, bins=np.linspace(0, 360, nph + 1), histtype="stepfilled",
@@ -241,11 +279,6 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
     ax_p.grid(alpha=0.25, lw=0.5)
     ax_p.set_xlim(0, 360)
     ax_p.set_xticks([0, 90, 180, 270, 360])
-    ax_p.legend([plt.Line2D([], [], color="none")],
-                ["N = %d\ncirc. mean %.1f$^\\circ$\nR = %.3f\n"
-                 "(flat would give %.3f)" % (n, cmu, R, R_flat)],
-                loc="upper right", fontsize=8.5, frameon=True, framealpha=0.9,
-                handlelength=0, handletextpad=0)
 
     # ---- 3. the radiograph ----
     use_scatter = (style == "scatter") or (style == "auto"
@@ -254,6 +287,10 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
     ax_r.set_theta_direction(1)          # phi as atan2 gives it: CCW from +x
     ax_r.set_rlim(0, tmax)
     ax_r.set_rlabel_position(112.5)
+    # radial ticks strictly inside the rim: a label sitting exactly at tmax
+    # lands on top of the 90 deg angular label
+    rstep = 10.0 if tmax > 50 else 5.0
+    ax_r.set_rticks(np.arange(rstep, tmax - 1e-9, rstep))
     ax_r.grid(alpha=0.35, lw=0.6, color="0.5")
 
     if use_scatter:
@@ -265,8 +302,10 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
         note = ("one point per muon, size and colour = the network's "
                 "confidence in $\\phi$")
     else:
-        pe = np.linspace(0, 2 * np.pi, nph * 2 + 1)
-        te = np.linspace(0, tmax, nth + 1)
+        nph_r = int(round(360.0 / radio_dphi))
+        nth_r = int(round(tmax / radio_dtheta))
+        pe = np.linspace(0, 2 * np.pi, nph_r + 1)
+        te = np.linspace(0, tmax, nth_r + 1)
         H, _, _ = np.histogram2d(np.radians(phi) % (2 * np.pi), theta,
                                  bins=[pe, te])
         lab = "muons / bin"
@@ -279,8 +318,9 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
         pc = ax_r.pcolormesh(P, T, H, cmap=CMAP, shading="auto", zorder=1)
         cb = fig.colorbar(pc, cax=ax_cb)
         cb.set_label(lab, fontsize=9)
-        note = ("density in %d $\\phi$ x %d $\\theta$ bins%s"
-                % (nph * 2, nth,
+        note = ("density in %g$^\\circ$ $\\phi$ x %g$^\\circ$ "
+                "$\\theta$ bins  (%d x %d)%s"
+                % (radio_dphi, radio_dtheta, nph_r, nth_r,
                    ", divided by bin solid angle" if solid_angle else ""))
     cb.ax.tick_params(labelsize=8)
 
@@ -293,6 +333,15 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
              "%.0f$^\\circ$ at the rim),  angle = $\\phi$" % tmax
              + "\n" + note, ha="center", va="top", fontsize=9.5,
              color="0.25", linespacing=1.5)
+    # the theta numbers sit on top of the image, so give them a colour that
+    # survives it: white with a thin dark stroke over the density, the other
+    # way round over the white background of the scatter
+    import matplotlib.patheffects as pe_fx
+    rc, sc_ = ("white", "black") if not use_scatter else ("0.15", "white")
+    plt.setp(ax_r.get_yticklabels(), color=rc, fontsize=9.5,
+             fontweight="bold",
+             path_effects=[pe_fx.withStroke(linewidth=1.8, foreground=sc_)])
+
     ax_r.set_xticks(np.radians(np.arange(0, 360, 45)))
     ax_r.set_xticklabels([r"$\phi$=0$^\circ$"] +
                          ["%d$^\\circ$" % d for d in range(45, 360, 45)],
@@ -322,8 +371,24 @@ def main(argv=None):
                    help="drop events whose phi confidence |(s,c)| is below "
                         "this FROM THE PLOTS (every event is still written to "
                         "the text file, with its confidence)")
-    p.add_argument("--theta-bins", type=int, default=45)
-    p.add_argument("--phi-bins", type=int, default=36)
+    p.add_argument("--theta-bins", type=int, default=45,
+                   help="bins in the 1D theta histogram (default 45)")
+    p.add_argument("--phi-bins", type=int, default=36,
+                   help="bins in the 1D phi histogram (default 36, i.e. 10 "
+                        "degrees)")
+    p.add_argument("--radio-dphi", type=float, default=10.0, metavar="DEG",
+                   help="radiograph phi bin width in degrees (default 10)")
+    p.add_argument("--radio-dtheta", type=float, default=5.0, metavar="DEG",
+                   help="radiograph theta bin width in degrees (default 5).  "
+                        "The outer radius is rounded up to a whole number of "
+                        "these.")
+    p.add_argument("--cos-power", type=float, default=2.0, metavar="P",
+                   help="exponent of the cos^P(theta) reference curve drawn "
+                        "on the theta panel (default 2, the sea-level "
+                        "approximation)")
+    p.add_argument("--no-cos-curve", action="store_true",
+                   help="do not draw the cos^P(theta) sin(theta) reference "
+                        "curve")
     p.add_argument("--theta-max", type=float, default=None,
                    help="outer radius of the radiograph and the top of the "
                         "theta axis (default: 99.5th percentile)")
@@ -448,7 +513,11 @@ def main(argv=None):
                            "%s   -   CNN muon directions" % tag, sub,
                            nth=args.theta_bins, nph=args.phi_bins,
                            style=args.style, solid_angle=args.solid_angle,
-                           theta_max=args.theta_max)
+                           theta_max=args.theta_max,
+                           radio_dphi=args.radio_dphi,
+                           radio_dtheta=args.radio_dtheta,
+                           cos_power=args.cos_power,
+                           show_cos=not args.no_cos_curve)
 
     cmu, R = circ_stats(phi[m])
     print("predictions over %d events%s"
