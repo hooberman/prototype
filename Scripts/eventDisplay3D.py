@@ -28,11 +28,27 @@ Input
 -----
 The per-event text files applyCNN.py --printTextFiles writes:
 
-    TrigID  theta  phi  phi_confidence
+    TrigID  theta  phi  phi_confidence  [t0 t1 t2 t3]
     <4 rows of 11 photon counts>
 
 Rows are detector columns A, B, C, D; array column 0 is ring 15 and column 10
 is ring 5, exactly as convertDataFile.py stores them.
+
+t0..t3 are optional CosmicWatch trigger ADC values, 0 to 1024.  Each drives
+one channel's OLED colour on the same ramp as the SiPMs, and lights its LED
+above 500.  Channels are numbered along the muon's path: 0 and 1 are the upper
+pair (outer unit first), 2 and 3 the lower pair (inner unit first).
+
+Trigger telescope
+-----------------
+Four 5 x 5 x 1 cm channels, the 1 cm axis radial about the track's axis
+crossing at z = TRACK_Z0, in two facing pairs on the accepted-muon direction
+theta = 50, phi = 0.  The distance, 14.18 cm, is set so the 5 cm face spans
+40 < theta < 60.  At that distance the face sits at cylindrical radius
+10.86 cm and so spans phi = -12.96 to +12.96 rather than the +/-8.5 asked for;
+a square face always subtends MORE in phi than in theta, because the phi lever
+arm is d*sin(theta) and the theta lever arm is d.  Getting +/-8.5 would need a
+3.25 cm width.  --trig-distance overrides the placement.
 
 Geometry
 --------
@@ -129,6 +145,30 @@ COL_PHI = {"A": 0.0, "B": 90.0, "C": 180.0, "D": 270.0}
 
 TRACK_Z0 = 3.0               # height at which the drawn track crosses the axis
 
+# ---- CosmicWatch trigger telescope -----------------------------------------
+# Four channels in two facing pairs, on the accepted-muon axis through
+# (0, 0, TRACK_Z0).  Channel order is along the muon's path: 0 and 1 are the
+# upper pair (outer first), 2 and 3 the lower pair (inner first).
+N_TRIG = 4
+TRIG_SIZE = 5.0              # scintillator face, 5 x 5 cm
+TRIG_THICK = 1.0             # 1 cm, along the radial direction
+TRIG_PAIR_GAP = 0.60         # between the two units of a pair
+TRIG_THETA = 50.0            # accepted direction: theta at the centre
+TRIG_PHI = 0.0               # ... and phi
+TRIG_DTHETA = 20.0           # full theta acceptance, i.e. 40 < theta < 60
+TRIG_ADC_MAX = 1024.0        # Arduino analogRead full scale
+TRIG_LED_ON = 500.0          # LED lights above this
+
+# The distance that makes the 5 cm face span TRIG_DTHETA in theta.
+TRIG_DIST = (TRIG_SIZE / 2.0) / np.tan(np.radians(TRIG_DTHETA / 2.0))
+
+CW_TAPE = "#141414"          # electrical tape over the scintillator
+CW_PCB = "#1d6b46"           # the CosmicWatch board
+CW_OLED = "#2b4f8f"          # the OLED breakout
+CW_SILVER = "#c8ccd2"
+CW_LED_OFF = "#9fb0b8"
+CW_LED_ON = "#ff4d3a"
+
 RING_HI, RING_LO = 15, 5     # the eleven rings that are read out
 NRING_DATA = RING_HI - RING_LO + 1
 
@@ -173,8 +213,14 @@ def read_event(path, nrow=4, nring=NRING_DATA):
                                                       len(lines)))
     h = lines[0].split()
     if len(h) < 4:
-        sys.exit("%s: header should be 'TrigID theta phi phi_confidence'"
-                 % path)
+        sys.exit("%s: header should be 'TrigID theta phi phi_confidence "
+                 "[t0 t1 t2 t3]'" % path)
+    trig = None
+    if len(h) >= 4 + N_TRIG:
+        trig = np.array([float(x) for x in h[4:4 + N_TRIG]], dtype=float)
+    elif len(h) > 4:
+        sys.exit("%s: header has %d extra values after phi_confidence, "
+                 "expected %d trigger ADC values" % (path, len(h) - 4, N_TRIG))
     counts = []
     for r in range(nrow):
         v = lines[1 + r].split()
@@ -188,6 +234,7 @@ def read_event(path, nrow=4, nring=NRING_DATA):
             "theta": float(h[1]),
             "phi": float(h[2]),
             "conf": float(h[3]),
+            "trig": trig,
             "counts": np.asarray(counts, dtype=float)}
 
 
@@ -369,6 +416,126 @@ def muon_meshes(theta_deg, phi_deg, length=19.0, phi_sense="to", z0=TRACK_Z0):
     return track, head, entry
 
 
+def trig_axis(phi_sense="to", theta=TRIG_THETA, phi=TRIG_PHI):
+    """Unit vector along the accepted muon's direction of travel."""
+    t, p = np.radians(theta), np.radians(phi)
+    a = np.array([np.sin(t) * np.cos(p), np.sin(t) * np.sin(p), np.cos(t)])
+    return np.array([a[0], a[1], -a[2]]) if phi_sense == "to" else -a
+
+
+def trig_placements(phi_sense="to", z0=TRACK_Z0, dist=TRIG_DIST,
+                    theta=TRIG_THETA, phi=TRIG_PHI):
+    """(centre, outward radial unit vector, is_outer) for the four channels.
+
+    Ordered along the muon's path: the upper pair first, outer unit first in
+    each pair, so channel 0 is the one the muon meets first.
+    """
+    u = trig_axis(phi_sense, theta, phi)
+    pivot = np.array([0.0, 0.0, float(z0)])
+    half = 0.5 * (TRIG_THICK + TRIG_PAIR_GAP)
+    out = []
+    for side in (-1.0, +1.0):                  # -1 = entry (upper) pair
+        w = side * u                           # outward from the pivot
+        for outer in (True, False) if side < 0 else (False, True):
+            r = dist + (half if outer else -half)
+            out.append((pivot + w * r, w, outer))
+    return out
+
+
+def cosmicwatch_meshes(centre, w, value, outer=True):
+    """One CosmicWatch-styled channel as (mesh, style) pairs.
+
+    Built in a local frame -- x radial (the 1 cm axis), y azimuthal, z polar --
+    then rotated onto (w, t, s) and translated to `centre`.  The board is put
+    on the far face of each unit so a pair shows its two scintillators meeting
+    in the middle, the way they sit on the bench.
+    """
+    w = np.asarray(w, dtype=float)
+    w = w / np.linalg.norm(w)
+    ex = w if outer else -w                    # local +x
+    zhat = np.array([0.0, 0.0, 1.0])
+    ey = np.cross(zhat, ex)
+    if np.linalg.norm(ey) < 1e-9:
+        ey = np.array([0.0, 1.0, 0.0])
+    ey /= np.linalg.norm(ey)
+    ez = np.cross(ex, ey)
+    M = np.eye(4)
+    M[:3, 0], M[:3, 1], M[:3, 2] = ex, ey, ez
+    M[:3, 3] = centre
+
+    s = TRIG_SIZE
+    parts = []
+
+    def add(mesh, **style):
+        parts.append((mesh.transform(M, inplace=False), style))
+
+    # ---- scintillator, wrapped in black tape ----
+    add(pv.Cube(center=(0, 0, 0), x_length=TRIG_THICK, y_length=s, z_length=s),
+        color=CW_TAPE, smooth_shading=False, specular=0.55, specular_power=18,
+        ambient=0.22, diffuse=0.75)
+    # a thin lighter band, so the tape reads as tape and not as a void
+    add(pv.Cube(center=(0, 0, -0.3), x_length=TRIG_THICK * 1.01,
+                y_length=s * 1.005, z_length=0.45),
+        color="#232323", smooth_shading=False, specular=0.8,
+        specular_power=30, ambient=0.25)
+
+    add(pv.Cube(center=(0, 0, 0.5 * s + 0.02), x_length=TRIG_THICK * 1.03,
+                y_length=s * 1.015, z_length=0.05),
+        color="#3c4349", smooth_shading=True, specular=1.0,
+        specular_power=75, ambient=0.28)
+
+    # ---- the board it sits on ----
+    # the board is TRIG_SIZE + 3.1 long, flush with the top of the
+    # scintillator and sticking out 3.1 cm below it, where the OLED goes
+    zb = -0.5 * s - 1.55                       # OLED centre
+    add(pv.Cube(center=(0.62, 0.0, -1.55),
+                x_length=0.18, y_length=s * 1.08, z_length=s + 3.1),
+        color=CW_PCB, smooth_shading=True, specular=0.4, specular_power=22,
+        ambient=0.22)
+
+    # ---- OLED breakout on the outer face, near the bottom ----
+    add(pv.Cube(center=(0.85, -0.85, zb), x_length=0.28, y_length=3.2,
+                z_length=2.4),
+        color=CW_OLED, smooth_shading=True, specular=0.5, specular_power=25,
+        ambient=0.25)
+    add(pv.Cube(center=(1.03, -0.85, zb - 0.12), x_length=0.12, y_length=2.7,
+                z_length=1.7),
+        color=screen_colour(value), smooth_shading=False, ambient=0.95,
+        diffuse=0.25, specular=0.6, specular_power=60)
+
+    # ---- indicator LED ----
+    lit = value is not None and value > TRIG_LED_ON
+    led = pv.Cylinder(center=(0.95, 1.85, zb), direction=(1, 0, 0),
+                      radius=0.26, height=0.6, resolution=18)
+    add(led, color=CW_LED_ON if lit else CW_LED_OFF, smooth_shading=True,
+        ambient=1.0 if lit else 0.30, diffuse=0.2 if lit else 0.8,
+        specular=1.0, specular_power=70, opacity=1.0 if lit else 0.65)
+    if lit:                                    # a soft bloom, as on the SiPMs
+        add(pv.Sphere(radius=0.68, center=(1.08, 1.85, zb)),
+            color=CW_LED_ON, opacity=0.18, ambient=1.0, diffuse=0.0,
+            specular=0.0)
+
+    # ---- BNC out of the end of the board ----
+    add(pv.Cube(center=(0.62, 0.5 * s * 1.08 + 0.35, zb + 1.5),
+                x_length=0.95, y_length=0.85, z_length=0.95),
+        color="#17181a", smooth_shading=True, specular=0.6, specular_power=30)
+    add(pv.Cylinder(center=(0.62, 0.5 * s * 1.08 + 1.15, zb + 1.5),
+                    direction=(0, 1, 0), radius=0.26, height=0.8,
+                    resolution=18),
+        color=CW_SILVER, smooth_shading=True, specular=1.0, specular_power=80,
+        ambient=0.20)
+    return parts
+
+
+def screen_colour(value):
+    """The OLED colour for an ADC value, on the same ramp as the SiPMs."""
+    if value is None:
+        return "#101418"
+    x = float(np.clip(value / TRIG_ADC_MAX, 0.0, 1.0))
+    r, g, b = GLOW(x)[:3]
+    return (float(r), float(g), float(b))
+
+
 def compass_meshes():
     """A brass bearing ring under the detector, with the four boards marked.
 
@@ -457,13 +624,17 @@ def hud_text(ev, counts, phi_sense="to"):
             "photons  %7d\n"
             "hottest  %s ring %d  (%d)\n"
             "boards   %s\n"
-            "light at %7.2f deg"
+            "light at %7.2f deg%s"
             % (ev["trgid"], ev["theta"], ev["phi"],
                "arrives from phi" if phi_sense == "from" else "travels to phi",
                ev["conf"], tot,
                COLS[hot[0]], RING_HI - hot[1], int(counts[hot]),
                "  ".join("%s %d" % (c, bt[i]) for i, c in enumerate(COLS)),
-               light_azimuth(counts)))
+               light_azimuth(counts),
+               "" if ev.get("trig") is None else
+               "\ntrigger  " + "  ".join(
+                   "%d%s" % (v, "*" if v > TRIG_LED_ON else "")
+                   for v in ev["trig"].astype(int))))
 
 
 class Display:
@@ -471,7 +642,8 @@ class Display:
 
     def __init__(self, events, cmap=GLOW, zmax=None, logscale=False,
                  off_screen=False, window_size=(1280, 960), halo=True,
-                 phi_sense="to", compass=True, track_z0=TRACK_Z0):
+                 phi_sense="to", compass=True, track_z0=TRACK_Z0,
+                 triggers=True, trig_dist=TRIG_DIST):
         self.events = events
         self.i = 0
         self.cmap = cmap
@@ -480,6 +652,8 @@ class Display:
         self.halo = halo
         self.phi_sense = phi_sense
         self.track_z0 = float(track_z0)
+        self.triggers = triggers
+        self.trig_dist = float(trig_dist)
         self.compass = compass
         self.dynamic = []                        # actors to clear each event
 
@@ -517,6 +691,9 @@ class Display:
         self.home_view()
         self.pl.add_key_event("r", self.home_view)
 
+    def trig_placements(self):
+        return trig_placements(self.phi_sense, self.track_z0, self.trig_dist)
+
     def home_view(self):
         """Three-quarter view framed on the detector, not on the track.
 
@@ -531,6 +708,11 @@ class Display:
             _, z_c, r_c = compass_meshes()
             rad = max(rad, r_c + 1.6)
             z_bot = min(z_bot, z_c - 1.0)
+        if self.triggers:
+            for c, _w, _o in self.trig_placements():
+                rad = max(rad, abs(c[0]) + 4.0, abs(c[1]) + 4.0)
+                z_bot = min(z_bot, c[2] - 6.0)
+                z_top = max(z_top, c[2] + 4.0)
         self.pl.reset_camera(bounds=(-rad, rad, -rad, rad, z_bot, z_top))
         self.pl.camera.zoom(1.02)
         self.pl.render()
@@ -578,6 +760,15 @@ class Display:
                     reset_camera=False,
                     opacity=0.22, show_scalar_bar=False, ambient=1.0,
                     diffuse=0.0, specular=0.0))
+
+        if self.triggers:
+            vals = ev.get("trig")
+            for k, (c, w, outer) in enumerate(self.trig_placements()):
+                v = None if vals is None else float(vals[k])
+                for mesh, style in cosmicwatch_meshes(c, w, v, outer):
+                    self.dynamic.append(self.pl.add_mesh(
+                        mesh, reset_camera=False, show_scalar_bar=False,
+                        **style))
 
         if self.compass:
             shaft, tip, _, _ = phi_pointer(ev["phi"])
@@ -700,6 +891,13 @@ def main(argv=None):
                         " the detector axis, in cm (default %g).  The impact "
                         "point is not reconstructed, so this only sets where "
                         "the line is placed, not its direction" % TRACK_Z0)
+    p.add_argument("--no-triggers", action="store_true",
+                   help="hide the four CosmicWatch trigger channels")
+    p.add_argument("--trig-distance", type=float, default=TRIG_DIST,
+                   metavar="CM", help="distance from the track's axis crossing"
+                        " to each trigger pair, in cm (default %.2f, the "
+                        "distance at which a %g cm face spans %g deg in theta)"
+                        % (TRIG_DIST, TRIG_SIZE, TRIG_DTHETA))
     p.add_argument("--no-compass", action="store_true",
                    help="hide the brass bearing ring, its A/B/C/D board tags "
                         "and the gold phi needle")
@@ -730,6 +928,16 @@ def main(argv=None):
           "(%d lit)" % (N_RING, SIPM_PITCH, RING_LO, RING_HI, NRING_DATA))
     print("colour     %s%s" % ("custom cyan-to-gold" if args.cmap is None
                                else args.cmap, ", log" if args.log else ""))
+    if not args.no_triggers:
+        rho = args.trig_distance * np.sin(np.radians(TRIG_THETA))
+        dt = np.degrees(np.arctan(TRIG_SIZE / 2.0 / args.trig_distance))
+        dp = np.degrees(np.arctan(TRIG_SIZE / 2.0 / rho))
+        print("trigger    4 CosmicWatch channels, %g x %g x %g cm, %.2f cm "
+              "from (0,0,%g)" % (TRIG_SIZE, TRIG_SIZE, TRIG_THICK,
+                                 args.trig_distance, args.track_z))
+        print("           axis theta %g phi %g; spans theta %.1f-%.1f, "
+              "phi %+.2f to %+.2f" % (TRIG_THETA, TRIG_PHI, TRIG_THETA - dt,
+                                      TRIG_THETA + dt, -dp, dp))
     print("phi sense  muon %s phi  (--phi-sense %s)"
           % ("ARRIVES FROM" if args.phi_sense == "from" else "TRAVELS TO",
              args.phi_sense))
@@ -748,7 +956,8 @@ def main(argv=None):
     d = Display(events, cmap=cmap, zmax=args.zmax, logscale=args.log,
                 off_screen=off, window_size=tuple(args.size),
                 halo=not args.no_halo, phi_sense=args.phi_sense,
-                compass=not args.no_compass, track_z0=args.track_z)
+                compass=not args.no_compass, track_z0=args.track_z,
+                triggers=not args.no_triggers, trig_dist=args.trig_distance)
 
     if args.screenshot:
         d.screenshot(args.screenshot)
