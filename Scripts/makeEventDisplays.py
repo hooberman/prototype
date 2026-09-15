@@ -34,9 +34,10 @@ is divided by the sum over the 58 cells of the image, the colour scale runs
 the lower left shows the total that was divided out, on a fixed axis so the
 bars are comparable between events.
 
---requireTrigger keeps only the events in which at least TRIG_NMIN (2) of the
-six CosmicWatch channels ch0-ch5 fired, a channel counting as fired when its
-RAW HG > TRIG_HG_MIN (1000) OR its RAW LG > TRIG_LG_MIN (500).  Raw, not
+--requireTrigger keeps only the events in which ALL FOUR of ch2, ch3, ch4,
+ch5 (CWA, CWB, CWC, CWD) fired, a channel counting as fired when its RAW
+HG > TRIG_HG_MIN (1000) OR its RAW LG > TRIG_LG_MIN (500).  ch0 and ch1 (CW
+top, CW bottom) are measured and reported but do not gate the event.  Raw, not
 pedestal subtracted: the threshold is a discriminator level on the number the
 board actually wrote down.  The LG arm is there so a channel whose HG has
 saturated or been clipped still counts.
@@ -88,11 +89,16 @@ NEVENTS = 100       # events drawn by default
 
 # --requireTrigger: the six CosmicWatch channels.  A channel counts as fired
 # when raw HG > TRIG_HG_MIN or raw LG > TRIG_LG_MIN, and the event is kept
-# when at least TRIG_NMIN of the six fired.
+# when ALL of TRIG_REQUIRED fired.  ch0/ch1 are still measured and reported,
+# they just do not gate the event.  An AND of four is fragile -- one dead
+# paddle takes the sample to zero -- so the per-channel fire rate is printed.
 TRIG_CH = (0, 1, 2, 3, 4, 5)   # ch0 CW top, ch1 CW bottom, ch2-5 CWA-CWD
+TRIG_NAME = {0: "CW top", 1: "CW bottom", 2: "CWA", 3: "CWB", 4: "CWC",
+             5: "CWD"}
+TRIG_REQUIRED = (2, 3, 4, 5)   # all of these must fire
 TRIG_HG_MIN = 1000.0
 TRIG_LG_MIN = 500.0
-TRIG_NMIN = 2
+TRIG_NMIN = len(TRIG_REQUIRED)   # all four
 
 # --constantLG: the scale used for every channel when the LG scale file is not
 # read, which is the default
@@ -162,10 +168,12 @@ def fired_trigger_channels(ev, chans=TRIG_CH, hgmin=TRIG_HG_MIN,
     return out
 
 
-def passes_trigger(ev, chans=TRIG_CH, hgmin=TRIG_HG_MIN, lgmin=TRIG_LG_MIN,
-                   nmin=TRIG_NMIN):
-    """True when at least nmin of the trigger channels fired."""
-    return len(fired_trigger_channels(ev, chans, hgmin, lgmin)) >= nmin
+def passes_trigger(ev, required=TRIG_REQUIRED, hgmin=TRIG_HG_MIN,
+                   lgmin=TRIG_LG_MIN, nmin=None):
+    """True when all of `required` fired (or at least nmin of them)."""
+    fired = set(fired_trigger_channels(ev, TRIG_CH, hgmin, lgmin))
+    need = len(required) if nmin is None else nmin
+    return sum(1 for c in required if c in fired) >= need
 
 
 def grid_total(sig):
@@ -714,13 +722,11 @@ def main(argv=None):
                    help="raw HG at or above this is saturated (default %g)"
                         % HG_SAT)
     p.add_argument("--requireTrigger", action="store_true",
-                   help="only draw events in which at least %d of the six "
-                        "CosmicWatch channels %s fired, a channel counting as "
-                        "fired when raw HG > %g OR raw LG > %g.  The whole "
-                        "file is read so that -n counts events that PASS the "
-                        "cut"
-                        % (TRIG_NMIN,
-                           ",".join("ch%d" % c for c in TRIG_CH),
+                   help="only draw events in which ALL of %s fired, a channel "
+                        "counting as fired when raw HG > %g OR raw LG > %g.  "
+                        "The whole file is read so that -n counts events that "
+                        "PASS the cut"
+                        % (",".join("ch%d" % c for c in TRIG_REQUIRED),
                            TRIG_HG_MIN, TRIG_LG_MIN))
     p.add_argument("--trig-hg", type=float, default=TRIG_HG_MIN,
                    help="raw HG above which a trigger channel counts as "
@@ -728,9 +734,12 @@ def main(argv=None):
     p.add_argument("--trig-lg", type=float, default=TRIG_LG_MIN,
                    help="raw LG above which a trigger channel counts as "
                         "fired (default %g)" % TRIG_LG_MIN)
-    p.add_argument("--trig-nmin", type=int, default=TRIG_NMIN,
-                   help="how many of the %d trigger channels must fire "
-                        "(default %d)" % (len(TRIG_CH), TRIG_NMIN))
+    p.add_argument("--trig-channels", default=None, metavar="LIST",
+                   help="comma-separated channels that must fire (default "
+                        "%s)" % ",".join(str(c) for c in TRIG_REQUIRED))
+    p.add_argument("--trig-nmin", type=int, default=None, metavar="N",
+                   help="require only N of those channels instead of all of "
+                        "them (default: all %d)" % len(TRIG_REQUIRED))
     p.add_argument("--skip-events", type=int, default=1,
                    help="drop this many events from the start of the run "
                         "(default 1: event 0 is a start-of-run artifact)")
@@ -806,23 +815,58 @@ def main(argv=None):
         sys.exit("no events to draw from %s" % src)
     ntrig_seen = len(events)
     ntrig_pass = ntrig_seen
-    nfired_hist = np.zeros(len(TRIG_CH) + 1, dtype=int)
+    if args.trig_channels:
+        try:
+            required = tuple(int(v) for v in
+                             args.trig_channels.replace(",", " ").split())
+        except ValueError:
+            sys.exit("--trig-channels %r is not a list of integers"
+                     % args.trig_channels)
+        if not required or any(not 0 <= c < NCH for c in required):
+            sys.exit("--trig-channels must name channels in 0..%d" % (NCH - 1))
+    else:
+        required = TRIG_REQUIRED
+    need = len(required) if args.trig_nmin is None else args.trig_nmin
+    if not 1 <= need <= len(required):
+        sys.exit("--trig-nmin %d makes no sense for %d channels"
+                 % (need, len(required)))
+
+    nfired_hist = np.zeros(len(required) + 1, dtype=int)
+    chan_fired = {c: 0 for c in TRIG_CH}
+    for ev in events:
+        for c in fired_trigger_channels(ev, TRIG_CH, args.trig_hg,
+                                        args.trig_lg):
+            chan_fired[c] += 1
     if args.requireTrigger:
         kept = []
         for ev in events:
-            nf = len(fired_trigger_channels(ev, TRIG_CH, args.trig_hg,
-                                            args.trig_lg))
-            nfired_hist[min(nf, len(TRIG_CH))] += 1
-            if nf >= args.trig_nmin:
+            fired = set(fired_trigger_channels(ev, TRIG_CH, args.trig_hg,
+                                               args.trig_lg))
+            nf = sum(1 for c in required if c in fired)
+            nfired_hist[nf] += 1
+            if nf >= need:
                 kept.append(ev)
         events = kept
         ntrig_pass = len(events)
         if not events:
-            sys.exit("no events in %s pass --requireTrigger (>= %d of %s with "
+            print("per-channel fire rate over the %d events tested:"
+                  % ntrig_seen)
+            for c in TRIG_CH:
+                print("   ch%-2d %-10s %7d  %6.2f %%%s"
+                      % (c, TRIG_NAME.get(c, ""), chan_fired[c],
+                         100.0 * chan_fired[c] / max(ntrig_seen, 1),
+                         "   <- required" if c in required else ""))
+            dead = [c for c in required if chan_fired[c] == 0]
+            if dead:
+                print("   %s never fired, so an AND over the required set can "
+                      "never pass."
+                      % ", ".join("ch%d" % c for c in dead))
+            sys.exit("no events in %s pass --requireTrigger (%s of %s with "
                      "raw HG > %g or raw LG > %g); %d events tested, "
                      "n fired = %s"
-                     % (src, args.trig_nmin,
-                        ",".join("ch%d" % c for c in TRIG_CH),
+                     % (src,
+                        "all" if need == len(required) else ">= %d" % need,
+                        ",".join("ch%d" % c for c in required),
                         args.trig_hg, args.trig_lg, ntrig_seen,
                         " ".join("%d:%d" % (i, n)
                                  for i, n in enumerate(nfired_hist) if n)))
@@ -870,18 +914,28 @@ def main(argv=None):
              else args.scale_col,
              " + c" if args.use_intercept else "", args.hg_sat))
     if args.requireTrigger:
-        print("trigger    --requireTrigger ON: >= %d of %s fired, where fired "
+        print("trigger    --requireTrigger ON: %s of %s fired, where fired "
               "= raw HG > %g OR raw LG > %g"
-              % (args.trig_nmin, ",".join("ch%d" % c for c in TRIG_CH),
+              % ("ALL %d" % need if need == len(required) else ">= %d" % need,
+                 ",".join("ch%d (%s)" % (c, TRIG_NAME.get(c, "?"))
+                          for c in required),
                  args.trig_hg, args.trig_lg))
         print("           %d of %d events pass (%.2f %%); the first %d are "
               "drawn"
               % (ntrig_pass, ntrig_seen,
                  100.0 * ntrig_pass / ntrig_seen if ntrig_seen else 0.0,
                  len(events)))
-        print("           channels fired per event: %s"
-              % "  ".join("%d->%d" % (i, n)
-                          for i, n in enumerate(nfired_hist) if n))
+        print("           of the required %s, this many fired per event: %s"
+              % (",".join("ch%d" % c for c in required),
+                 "  ".join("%d->%d" % (i, n)
+                           for i, n in enumerate(nfired_hist) if n)))
+        print("           per-channel fire rate (a dead paddle zeroes an "
+              "AND):")
+        for c in TRIG_CH:
+            print("             ch%-2d %-10s %7d  %6.2f %%%s"
+                  % (c, TRIG_NAME.get(c, ""), chan_fired[c],
+                     100.0 * chan_fired[c] / max(ntrig_seen, 1),
+                     "   <- required" if c in required else ""))
     if args.normalize:
         print("normalize  ON: each cell / (sum over the %d image cells) * 100"
               % len(GRID_CH))
