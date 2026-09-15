@@ -47,6 +47,40 @@ Taken from the CAD and the bv4 gerbers:
 Ring 15 is at the top.  Rings 0-4 exist on the board but are not in the data,
 so only the upper eleven positions are drawn.
 
+Which way is phi
+----------------
+Board A sits at phi = 0 and B, C, D follow counter-clockwise seen from above,
+at 90, 180 and 270.  That handedness is checked against the training MC: the
+azimuth of the light centroid, computed from the four board totals, reproduces
+the generated phi exactly (mean cos(dphi) = 1.000 over 4000 events), while the
+mirrored assignment gives 0.000.  The brass bearing ring under the detector
+shows the four boards and carries a gold needle along phi, and the HUD prints
+both the network's phi and the azimuth of the light, so the two can be
+compared at a glance.
+
+Which end of the track is at phi is NOT a free convention, and the MC cannot
+answer it: there the ring profile is identical on all four boards, so the
+training data has no z-phi correlation at all.  The real data does have one.
+Fitting the ring-centroid difference between the board nearest the light and
+the board opposite it, over the 834 triggered events of Run140:
+
+    cen_near - cen_far = +0.62 * tan(theta) - 0.44      (slope 9.4 sigma)
+
+with the ring index increasing downwards.  A positive slope means the phi-side
+board is lit LOWER than the board opposite, and the separation grows with the
+track's tilt, exactly as a straight track should.  So the phi end of the track
+is its BOTTOM end: the muon TRAVELS TOWARDS phi, entering high on the far side
+and leaving low on the phi side.  That is the default.  --phi-sense flips it:
+
+    to     (default)  muon travels towards phi -- the sense the data supports
+    from              muon arrives from phi: the same line rotated 180 deg in
+                      azimuth, kept for comparison
+
+(The fitted slope is ~6x smaller than the 2R/pitch = 3.8 a track through the
+detector centre would give, which is what you would expect once the light
+spreads and the tracks are spread over impact parameter.  The -0.44 offset is
+a common-mode board asymmetry and does not affect the sign.)
+
 Web
 ---
 --html writes a self-contained page (vtk.js under the hood) that rotates,
@@ -93,6 +127,8 @@ R_SIPM = R_PCB                                # drawn centred on the board
 COLS = ["A", "B", "C", "D"]
 COL_PHI = {"A": 0.0, "B": 90.0, "C": 180.0, "D": 270.0}
 
+TRACK_Z0 = 3.0               # height at which the drawn track crosses the axis
+
 RING_HI, RING_LO = 15, 5     # the eleven rings that are read out
 NRING_DATA = RING_HI - RING_LO + 1
 
@@ -111,6 +147,7 @@ SCINT = "#9ec9ee"
 PCB_GREEN = "#12503a"
 BRASS = "#c39a5e"
 BRASS_DARK = "#8a6a38"
+BRASS_LIT = "#ffd27f"          # the phi needle on the bearing ring
 GUNMETAL = "#2b3138"
 MUON = "#31e8ff"
 HUD = "#8fe8f2"
@@ -292,22 +329,91 @@ def build_halo(counts, frac=0.12):
     return pv.MultiBlock(blocks).combine() if blocks else None
 
 
-def muon_meshes(theta_deg, phi_deg, length=19.0):
-    """The muon as a line through the detector centre, plus an arrow head.
+def muon_meshes(theta_deg, phi_deg, length=19.0, phi_sense="to", z0=TRACK_Z0):
+    """The muon as a line through the detector axis at z0, plus an arrow head.
 
     theta is the zenith angle (0 = straight down the axis) and phi the
     azimuth, the same convention the CNN predicts.  The impact point is not
-    reconstructed, so the track is drawn through the origin -- it shows the
-    DIRECTION, not where the muon actually crossed.
+    reconstructed, so the track is drawn crossing the axis at a fixed height
+    z0 -- it shows the DIRECTION, not where the muon actually crossed.
+
+    z0 defaults to +3 cm rather than 0 because the eleven instrumented rings
+    run from z = -4.9 to +14.7 cm, so the read-out part of the detector is not
+    centred on the origin and a track through z = 0 sits low in it.
+
+    The muon always goes downwards.  `phi_sense` says what phi means:
+
+      "to"    (default) phi is the azimuth the muon TRAVELS TOWARDS: in from
+              the far side high up, out through the phi side low down, so the
+              track passes through the brightest SiPMs.  This is what the real
+              data says -- see the fit quoted in the module docstring.
+
+      "from"  phi is the azimuth the muon ARRIVES FROM.  The same line rotated
+              180 deg in azimuth.
     """
     t, p = np.radians(theta_deg), np.radians(phi_deg)
-    d = np.array([np.sin(t) * np.cos(p), np.sin(t) * np.sin(p), np.cos(t)])
-    top, bot = d * length, -d * length            # travels top -> bottom
-    track = pv.Line(top, bot).tube(radius=0.085, n_sides=20)
-    head = pv.Cone(center=bot + d * 0.9, direction=-d, height=1.8,
+    # unit vector pointing up-and-out along azimuth phi
+    a = np.array([np.sin(t) * np.cos(p), np.sin(t) * np.sin(p), np.cos(t)])
+    if phi_sense == "to":
+        # down-going, azimuth phi: mirror the horizontal part, keep it falling
+        u = np.array([a[0], a[1], -a[2]])
+    else:
+        u = -a                                     # down-going, away from phi
+    shift = np.array([0.0, 0.0, float(z0)])
+    entry_pt = -u * length + shift                 # always top -> bottom
+    exit_pt = u * length + shift
+    track = pv.Line(entry_pt, exit_pt).tube(radius=0.085, n_sides=20)
+    head = pv.Cone(center=exit_pt - u * 0.9, direction=u, height=1.8,
                    radius=0.42, resolution=24)
-    entry = pv.Sphere(radius=0.28, center=top)
+    entry = pv.Sphere(radius=0.28, center=entry_pt)
     return track, head, entry
+
+
+def compass_meshes():
+    """A brass bearing ring under the detector, with the four boards marked.
+
+    This exists so that 'which way is phi' is answerable from the picture
+    instead of from the source code.
+    """
+    z = -0.5 * H_CYL - 1.9
+    rr = R_PCB * 1.55
+    ang = np.radians(np.arange(0.0, 361.0, 3.0))
+    pts = np.c_[rr * np.cos(ang), rr * np.sin(ang), np.full(ang.size, z)]
+    parts = [(pv.lines_from_points(pts).tube(radius=0.055, n_sides=12),
+              dict(color=BRASS, smooth_shading=True, specular=1.0,
+                   specular_power=70, ambient=0.20))]
+    for deg in range(0, 360, 15):
+        major = (deg % 90) == 0
+        ln = 0.55 if major else 0.25
+        parts.append((placed_box(rr + ln / 2, float(deg), z,
+                                 ln, 0.11 if major else 0.06, 0.11),
+                      dict(color=BRASS if major else BRASS_DARK,
+                           smooth_shading=True, specular=0.9,
+                           specular_power=60)))
+    return parts, z, rr
+
+
+def compass_labels():
+    """(positions, strings) for the A/B/C/D board tags on the bearing ring."""
+    _, z, rr = compass_meshes()
+    pos, txt = [], []
+    for col in COLS:
+        p = np.radians(COL_PHI[col])
+        pos.append([(rr + 1.2) * np.cos(p), (rr + 1.2) * np.sin(p), z])
+        txt.append("%s  %d°" % (col, int(COL_PHI[col])))
+    return np.asarray(pos), txt
+
+
+def phi_pointer(phi_deg):
+    """The gold needle on the bearing ring, laid along azimuth phi."""
+    _, z, rr = compass_meshes()
+    p = np.radians(phi_deg)
+    d = (np.cos(p), np.sin(p), 0.0)
+    shaft = pv.Line((0, 0, z), (rr * 0.93 * d[0], rr * 0.93 * d[1], z)) \
+              .tube(radius=0.07, n_sides=12)
+    tip = pv.Cone(center=(rr * 0.99 * d[0], rr * 0.99 * d[1], z),
+                  direction=d, height=0.9, radius=0.26, resolution=20)
+    return shaft, tip, z, rr
 
 
 # ----------------------------------------------------------------------------
@@ -326,30 +432,55 @@ def light_rig(pl):
                               light_type="scene light"))
 
 
-def hud_text(ev, counts):
+def light_azimuth(counts):
+    """Azimuth of the light centroid, from the four board totals.
+
+    In the training MC this is exactly the generated phi, so it is the one
+    number that says whether the lit SiPMs and the drawn track agree.
+    """
+    tot = counts.sum(axis=1)
+    b = np.radians([COL_PHI[c] for c in COLS])
+    x, y = float((tot * np.cos(b)).sum()), float((tot * np.sin(b)).sum())
+    if x == 0.0 and y == 0.0:
+        return float("nan")
+    return np.degrees(np.arctan2(y, x)) % 360.0
+
+
+def hud_text(ev, counts, phi_sense="to"):
     tot = int(counts.sum())
     hot = np.unravel_index(int(np.argmax(counts)), counts.shape)
+    bt = counts.sum(axis=1)
     return ("TrgID %d\n"
-            "theta   %7.2f deg\n"
-            "phi     %7.2f deg\n"
-            "conf    %7.3f\n"
-            "photons %7d\n"
-            "hottest %s ring %d  (%d)"
-            % (ev["trgid"], ev["theta"], ev["phi"], ev["conf"], tot,
-               COLS[hot[0]], RING_HI - hot[1], int(counts[hot])))
+            "theta    %7.2f deg\n"
+            "phi      %7.2f deg   (muon %s)\n"
+            "conf     %7.3f\n"
+            "photons  %7d\n"
+            "hottest  %s ring %d  (%d)\n"
+            "boards   %s\n"
+            "light at %7.2f deg"
+            % (ev["trgid"], ev["theta"], ev["phi"],
+               "arrives from phi" if phi_sense == "from" else "travels to phi",
+               ev["conf"], tot,
+               COLS[hot[0]], RING_HI - hot[1], int(counts[hot]),
+               "  ".join("%s %d" % (c, bt[i]) for i, c in enumerate(COLS)),
+               light_azimuth(counts)))
 
 
 class Display:
     """Holds the plotter and swaps the per-event actors in and out."""
 
     def __init__(self, events, cmap=GLOW, zmax=None, logscale=False,
-                 off_screen=False, window_size=(1280, 960), halo=True):
+                 off_screen=False, window_size=(1280, 960), halo=True,
+                 phi_sense="to", compass=True, track_z0=TRACK_Z0):
         self.events = events
         self.i = 0
         self.cmap = cmap
         self.zmax = zmax
         self.log = logscale
         self.halo = halo
+        self.phi_sense = phi_sense
+        self.track_z0 = float(track_z0)
+        self.compass = compass
         self.dynamic = []                        # actors to clear each event
 
         self.pl = pv.Plotter(off_screen=off_screen, window_size=window_size,
@@ -357,6 +488,13 @@ class Display:
         self.pl.set_background(BG_LOW, top=BG_HIGH)
         for mesh, style in build_detector():
             self.pl.add_mesh(mesh, **style)
+        if self.compass:
+            for mesh, style in compass_meshes()[0]:
+                self.pl.add_mesh(mesh, reset_camera=False, **style)
+            pos, txt = compass_labels()
+            self.pl.add_point_labels(pos, txt, font_size=13,
+                                     text_color=BRASS, shape=None,
+                                     show_points=False, always_visible=True)
         light_rig(self.pl)
 
         # transparency has to be resolved properly or the SiPMs vanish behind
@@ -387,9 +525,13 @@ class Display:
         """
         self.pl.camera_position = [(1.35, -1.15, 0.58), (0, 0, 0), (0, 0, 1)]
         z_top = ring_z(N_RING - 1) + 5.1          # the connector end
-        self.pl.reset_camera(bounds=(-R_PCB * 2.0, R_PCB * 2.0,
-                                     -R_PCB * 2.0, R_PCB * 2.0,
-                                     z_top - PCB_LEN, z_top))
+        z_bot = z_top - PCB_LEN
+        rad = R_PCB * 2.0
+        if self.compass:
+            _, z_c, r_c = compass_meshes()
+            rad = max(rad, r_c + 1.6)
+            z_bot = min(z_bot, z_c - 1.0)
+        self.pl.reset_camera(bounds=(-rad, rad, -rad, rad, z_bot, z_top))
         self.pl.camera.zoom(1.02)
         self.pl.render()
 
@@ -437,7 +579,17 @@ class Display:
                     opacity=0.22, show_scalar_bar=False, ambient=1.0,
                     diffuse=0.0, specular=0.0))
 
-        track, head, entry = muon_meshes(ev["theta"], ev["phi"])
+        if self.compass:
+            shaft, tip, _, _ = phi_pointer(ev["phi"])
+            for m in (shaft, tip):
+                self.dynamic.append(self.pl.add_mesh(
+                    m, color=BRASS_LIT, smooth_shading=True,
+                    reset_camera=False, ambient=0.55, diffuse=0.7,
+                    specular=1.0, specular_power=70, show_scalar_bar=False))
+
+        track, head, entry = muon_meshes(ev["theta"], ev["phi"],
+                                         phi_sense=self.phi_sense,
+                                         z0=self.track_z0)
         for m, op in ((track, 1.0), (head, 1.0), (entry, 0.9)):
             self.dynamic.append(self.pl.add_mesh(
                 m, color=MUON, smooth_shading=True, opacity=op,
@@ -453,7 +605,8 @@ class Display:
             show_scalar_bar=False))
 
         self.dynamic.append(self.pl.add_text(
-            hud_text(ev, counts), position="upper_left", font_size=11,
+            hud_text(ev, counts, self.phi_sense),
+            position="upper_left", font_size=11,
             color=HUD, font="courier", shadow=True))
         foot = ev["name"]
         if len(self.events) > 1:
@@ -536,6 +689,20 @@ def main(argv=None):
                         "cyan-to-gold ramp)")
     p.add_argument("--no-halo", action="store_true",
                    help="turn off the soft glow around the bright SiPMs")
+    p.add_argument("--phi-sense", choices=("to", "from"), default="to",
+                   help="what phi means for the drawn track.  'from' (default)"
+                        " = the muon arrives from azimuth phi, entering high "
+                        "on the phi side, which is the sense that matches the "
+                        "training MC.  'to' = it travels towards phi, i.e. the"
+                        " same line rotated 180 deg in azimuth")
+    p.add_argument("--track-z", type=float, default=TRACK_Z0,
+                   metavar="CM", help="height at which the drawn track crosses"
+                        " the detector axis, in cm (default %g).  The impact "
+                        "point is not reconstructed, so this only sets where "
+                        "the line is placed, not its direction" % TRACK_Z0)
+    p.add_argument("--no-compass", action="store_true",
+                   help="hide the brass bearing ring, its A/B/C/D board tags "
+                        "and the gold phi needle")
     p.add_argument("--size", type=int, nargs=2, default=[1280, 960],
                    metavar=("W", "H"), help="window / image size")
     args = p.parse_args(argv)
@@ -563,12 +730,25 @@ def main(argv=None):
           "(%d lit)" % (N_RING, SIPM_PITCH, RING_LO, RING_HI, NRING_DATA))
     print("colour     %s%s" % ("custom cyan-to-gold" if args.cmap is None
                                else args.cmap, ", log" if args.log else ""))
+    print("phi sense  muon %s phi  (--phi-sense %s)"
+          % ("ARRIVES FROM" if args.phi_sense == "from" else "TRAVELS TO",
+             args.phi_sense))
+    print("-" * 70)
+    print("  %-18s %8s %8s   %s" % ("event", "phi_CNN", "phi_light",
+                                    "board totals  " +
+                                    " ".join("%5s" % c for c in COLS)))
+    for e in events:
+        bt = e["counts"].sum(axis=1)
+        print("  %-18s %8.2f %8.2f                 %s"
+              % (e["name"], e["phi"], light_azimuth(e["counts"]),
+                 " ".join("%5d" % v for v in bt)))
     print("-" * 70)
 
     off = bool(args.html or args.screenshot)
     d = Display(events, cmap=cmap, zmax=args.zmax, logscale=args.log,
                 off_screen=off, window_size=tuple(args.size),
-                halo=not args.no_halo)
+                halo=not args.no_halo, phi_sense=args.phi_sense,
+                compass=not args.no_compass, track_z0=args.track_z)
 
     if args.screenshot:
         d.screenshot(args.screenshot)
