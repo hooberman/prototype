@@ -77,6 +77,19 @@ RING_HI = 15
 CMAP = "inferno"
 SCATTER_BELOW = 1500    # fewer events than this: draw points, not a density
 
+# The theta axis is FIXED, on both the 1D spectrum and the radiograph, so
+# plots from different runs can be laid side by side.  --theta-max overrides.
+# Events above it are not plotted; how many were clipped is always reported.
+THETA_MAX_DEG = 80.0
+
+# --showTarget: the region the muons are being aimed at.  theta between
+# TARGET_THETA, phi within TARGET_PHI of straight ahead.
+TARGET_THETA = (40.0, 60.0)
+TARGET_PHI = (-8.5, 8.5)
+TARGET_FILL = "#a8d3f0"     # light blue
+TARGET_EDGE = "#3f88c5"
+DOT_COLOR = "#cc3311"       # the one red the dots take under --showTarget
+
 
 # ----------------------------------------------------------------------------
 # model
@@ -189,6 +202,41 @@ def circ_stats(phi_deg):
     return np.degrees(np.arctan2(s, c)) % 360.0, float(np.hypot(s, c))
 
 
+def in_target(theta, phi, target_theta=TARGET_THETA, target_phi=TARGET_PHI):
+    """Mask of events inside the --showTarget region.
+
+    theta between the two limits, and phi within the given window of its
+    centre -- done as a wrapped difference so a window straddling 0/360
+    (which -8.5 .. +8.5 does) works without special-casing.
+    """
+    tlo, thi = sorted(float(v) for v in target_theta)
+    plo, phi_hi = sorted(float(v) for v in target_phi)
+    pmid = 0.5 * (plo + phi_hi)
+    phalf = 0.5 * (phi_hi - plo)
+    dphi = (np.asarray(phi, dtype=float) - pmid + 180.0) % 360.0 - 180.0
+    t = np.asarray(theta, dtype=float)
+    return (t >= tlo) & (t <= thi) & (np.abs(dphi) <= phalf)
+
+
+def draw_target(ax, target_theta=TARGET_THETA, target_phi=TARGET_PHI):
+    """The shaded target wedge on the polar axes.
+
+    zorder 2: above the density (1) and below the dots (3), which is the
+    order asked for -- the muons have to be readable on top of the region.
+    """
+    tlo, thi = sorted(float(v) for v in target_theta)
+    plo, phi_hi = sorted(float(v) for v in target_phi)
+    ang = np.radians(np.linspace(plo, phi_hi, 200))
+    ax.fill_between(ang, tlo, thi, color=TARGET_FILL, alpha=0.75,
+                    linewidth=0, zorder=2)
+    for r in (tlo, thi):
+        ax.plot(ang, np.full_like(ang, r), color=TARGET_EDGE, lw=1.0,
+                alpha=0.9, zorder=2.1)
+    for a in (plo, phi_hi):
+        ax.plot([np.radians(a)] * 2, [tlo, thi], color=TARGET_EDGE, lw=1.0,
+                alpha=0.9, zorder=2.1)
+
+
 def cos_power_curve(x_deg, tmax, n_in, binw_deg, power=2.0):
     """Expected muons per bin for a flux isotropic in phi and ~cos^p(theta).
 
@@ -217,14 +265,16 @@ def cos_power_curve(x_deg, tmax, n_in, binw_deg, power=2.0):
 def make_page(theta, phi, conf, out_paths, title, subtitle,
               nth=45, nph=36, style="auto", solid_angle=False,
               theta_max=None, radio_dphi=10.0, radio_dtheta=5.0,
-              cos_power=2.0, show_cos=True):
+              cos_power=2.0, show_cos=True, show_target=False,
+              target_theta=TARGET_THETA, target_phi=TARGET_PHI):
     """One page: theta spectrum, phi spectrum, and the circular radiograph."""
     n = theta.size
-    tmax = theta_max if theta_max else float(
-        min(90.0, max(10.0, np.percentile(theta, 99.5) * 1.05)))
+    # fixed range, so runs can be compared directly
+    tmax = float(theta_max) if theta_max else THETA_MAX_DEG
     # round up to a whole number of radiograph theta bins, so the rim lands on
     # a bin edge and the radial ticks come out on round numbers
     tmax = float(radio_dtheta * np.ceil(tmax / radio_dtheta))
+    n_over = int(np.sum(theta > tmax))
 
     # explicit axes rather than a gridspec: the radiograph has to stay round
     # and large, and the two spectra have to clear the header
@@ -260,6 +310,14 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
     ax_t.set_title(r"zenith angle $\theta$", fontsize=12)
     ax_t.grid(alpha=0.25, lw=0.5)
     ax_t.set_xlim(0, tmax)
+    # the axis is fixed, so say plainly when events fell off the end of it
+    if n_over:
+        ax_t.annotate("%d event%s above %.0f$^\\circ$ not shown"
+                      % (n_over, "" if n_over == 1 else "s", tmax),
+                      xy=(0.985, 0.965), xycoords="axes fraction",
+                      ha="right", va="top", fontsize=7.5, color="#cc3311",
+                      bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                                edgecolor="none", alpha=0.85))
 
     # ---- 2. phi ----
     ax_p.hist(phi, bins=np.linspace(0, 360, nph + 1), histtype="stepfilled",
@@ -293,12 +351,28 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
     ax_r.set_rticks(np.arange(rstep, tmax - 1e-9, rstep))
     ax_r.grid(alpha=0.35, lw=0.6, color="0.5")
 
-    if use_scatter:
+    # the target wedge goes down first, so the muons land on top of it
+    if show_target:
+        draw_target(ax_r, target_theta, target_phi)
+
+    if use_scatter and show_target:
+        # one colour, one size: the point of this plot is where the muons sit
+        # relative to the region, not what the network thought of each one
+        ax_r.scatter(np.radians(phi), theta, s=14, color=DOT_COLOR,
+                     alpha=0.85, edgecolors="none", zorder=3)
+        ax_cb.set_visible(False)
+        tlo, thi = sorted(float(v) for v in target_theta)
+        plo, phi_hi = sorted(float(v) for v in target_phi)
+        note = ("one point per muon;  shaded: %g$^\\circ$ < $\\theta$ < "
+                "%g$^\\circ$, %g$^\\circ$ < $\\phi$ < %g$^\\circ$"
+                % (tlo, thi, plo, phi_hi))
+    elif use_scatter:
         sz = np.clip(6.0 + 40.0 * (conf / max(conf.max(), 1e-9)), 4, 55)
         sc = ax_r.scatter(np.radians(phi), theta, c=conf, s=sz, cmap=CMAP,
                           alpha=0.85, edgecolors="none", zorder=3)
         cb = fig.colorbar(sc, cax=ax_cb)
         cb.set_label(r"$\phi$ confidence  $|(s,c)|$", fontsize=9)
+        cb.ax.tick_params(labelsize=8)
         note = ("one point per muon, size and colour = the network's "
                 "confidence in $\\phi$")
     else:
@@ -322,7 +396,12 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
                 "$\\theta$ bins  (%d x %d)%s"
                 % (radio_dphi, radio_dtheta, nph_r, nth_r,
                    ", divided by bin solid angle" if solid_angle else ""))
-    cb.ax.tick_params(labelsize=8)
+        if show_target:
+            note += "\n" + ("shaded: %g$^\\circ$ < $\\theta$ < %g$^\\circ$, "
+                            "%g$^\\circ$ < $\\phi$ < %g$^\\circ$"
+                            % (min(target_theta), max(target_theta),
+                               min(target_phi), max(target_phi)))
+        cb.ax.tick_params(labelsize=8)
 
     # the radiograph caption goes on the figure, not on the axes: a polar
     # axes title sits on top of the circle and would run into the spectra
@@ -389,9 +468,27 @@ def main(argv=None):
     p.add_argument("--no-cos-curve", action="store_true",
                    help="do not draw the cos^P(theta) sin(theta) reference "
                         "curve")
-    p.add_argument("--theta-max", type=float, default=None,
+    p.add_argument("--theta-max", type=float, default=None, metavar="DEG",
                    help="outer radius of the radiograph and the top of the "
-                        "theta axis (default: 99.5th percentile)")
+                        "1D theta axis (default %g, fixed so runs can be "
+                        "compared; events above it are not plotted and the "
+                        "number clipped is reported)" % THETA_MAX_DEG)
+    p.add_argument("--showTarget", action="store_true",
+                   help="draw the target region on the radiograph as a light "
+                        "blue wedge and make every muon the same red dot on "
+                        "top of it.  The wedge runs %g-%g deg in theta and "
+                        "%g to %g deg in phi; the fraction of muons inside it "
+                        "is reported"
+                        % (TARGET_THETA[0], TARGET_THETA[1],
+                           TARGET_PHI[0], TARGET_PHI[1]))
+    p.add_argument("--target-theta", type=float, nargs=2, metavar=("LO", "HI"),
+                   default=list(TARGET_THETA),
+                   help="theta limits of the --showTarget wedge (default "
+                        "%g %g)" % TARGET_THETA)
+    p.add_argument("--target-phi", type=float, nargs=2, metavar=("LO", "HI"),
+                   default=list(TARGET_PHI),
+                   help="phi limits of the --showTarget wedge, may straddle 0 "
+                        "(default %g %g)" % TARGET_PHI)
     p.add_argument("--style", choices=["auto", "density", "scatter"],
                    default="auto",
                    help="radiograph style; auto draws points below %d events "
@@ -508,16 +605,23 @@ def main(argv=None):
               else " with |(s,c)| >= %g (of %d)" % (args.min_conf, n),
               os.path.basename(os.path.dirname(args.model_dir)),
               theta[m].mean(), theta[m].std(), circ_stats(phi[m])[1]))
+    style = args.style
+    if args.showTarget and style == "auto":
+        style = "scatter"       # "the dots" -- a density has none
+
     paths = [out_png] + ([] if args.no_pdf else [out_pdf])
     tmax, scat = make_page(theta[m], phi[m], conf[m], paths,
                            "%s   -   CNN muon directions" % tag, sub,
                            nth=args.theta_bins, nph=args.phi_bins,
-                           style=args.style, solid_angle=args.solid_angle,
+                           style=style, solid_angle=args.solid_angle,
                            theta_max=args.theta_max,
                            radio_dphi=args.radio_dphi,
                            radio_dtheta=args.radio_dtheta,
                            cos_power=args.cos_power,
-                           show_cos=not args.no_cos_curve)
+                           show_cos=not args.no_cos_curve,
+                           show_target=args.showTarget,
+                           target_theta=args.target_theta,
+                           target_phi=args.target_phi)
 
     cmu, R = circ_stats(phi[m])
     print("predictions over %d events%s"
@@ -542,8 +646,33 @@ def main(argv=None):
     print("  train cut %d/%d events pass the selection the model was trained "
           "behind" % (int(tcut.sum()), n))
     print("-" * 78)
-    print("radiograph %s, outer radius theta = %.1f deg"
-          % ("scatter, one point per muon" if scat else "density", tmax))
+    nover = int(np.sum(theta[m] > tmax))
+    print("radiograph %s, outer radius theta = %.1f deg (fixed)%s"
+          % ("scatter, one point per muon" if scat else "density", tmax,
+             ";  %d event%s above it are not plotted"
+             % (nover, "" if nover == 1 else "s") if nover else ""))
+    if args.showTarget:
+        tgt = in_target(theta[m], phi[m], args.target_theta, args.target_phi)
+        tlo, thi = sorted(args.target_theta)
+        plo, phi_hi = sorted(args.target_phi)
+        # solid angle of the wedge / of the whole plotted cap, i.e. what an
+        # isotropic sample would put there
+        om_t = np.cos(np.radians(tlo)) - np.cos(np.radians(thi))
+        om_cap = 1.0 - np.cos(np.radians(tmax))
+        f_flat = (om_t / om_cap) * ((phi_hi - plo) / 360.0)
+        nin = int(tgt.sum())
+        exp = f_flat * int(m.sum())
+        print("target     %g < theta < %g deg,  %g < phi < %g deg"
+              % (tlo, thi, plo, phi_hi))
+        print("           %d of %d muons inside (%.2f %%);  an isotropic "
+              "sample would put %.1f there (%.2f %%)"
+              % (nin, int(m.sum()), 100.0 * nin / max(int(m.sum()), 1),
+                 exp, 100.0 * f_flat))
+        if exp > 0:
+            print("           ratio to isotropic = %.2f%s"
+                  % (nin / exp,
+                     "   (+-%.2f from counting alone)" % (np.sqrt(max(nin, 1))
+                                                          / exp)))
     print("wrote %s" % out_txt)
     for p in paths:
         print("wrote %s" % p)
