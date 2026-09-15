@@ -73,6 +73,11 @@ NROW = 4                # detector columns A, B, C, D
 NRING = 11              # rings 15 (output column 0) down to 5
 COLS = ["A", "B", "C", "D"]
 RING_HI = 15
+RING_LO = RING_HI - NRING + 1       # 5
+
+# --showEventDisplays: drawing one png per event gets out of hand fast, so
+# there is a cap.  Raise it with --max-displays.
+MAX_DISPLAYS = 50
 
 CMAP = "inferno"
 SCATTER_BELOW = 1500    # fewer events than this: draw points, not a density
@@ -190,6 +195,102 @@ def predict(model, cfg, images, batch_size=256):
     phi = np.degrees(np.arctan2(s, c))
     phi = (phi - post["phi_lo"]) % 360.0 + post["phi_lo"]
     return theta, phi, np.hypot(s, c)
+
+
+# ----------------------------------------------------------------------------
+# --showEventDisplays: one detector image per surviving event
+# ----------------------------------------------------------------------------
+def _text_colour(rgba):
+    lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+    return "black" if lum > 0.55 else "white"
+
+
+def image_to_grid(img):
+    """(4, 11) as stored -> (11, 4) as the detector is drawn.
+
+    convertDataFile.py writes rows = detector columns A,B,C,D and output
+    column 0 = ring 15, so getting back to a picture of the detector means
+    transposing and flipping: ring 15 ends up on the TOP row, ring 5 on the
+    bottom, columns A B C D left to right -- the same orientation
+    makeEventDisplays.py uses.
+    """
+    return np.asarray(img, dtype=float).T[::-1, :]
+
+
+def draw_photon_event(img, out_png, title, subtitle, vmin=0.0, vmax=None,
+                      cmap_name=CMAP, logscale=False, mark_peak=True):
+    """One event's 4 x 11 photon image, in makeEventDisplays.py's style.
+
+    These are the PHOTON COUNTS the network was handed, not raw ADC, and the
+    CosmicWatch channels are not in them: convertDataFile.py drops ch0-5 and
+    rings 0-4 before writing.  So there are no CW strips above and below the
+    grid and no saturation flags -- by this point the LG substitution has
+    already happened upstream.
+    """
+    grid = image_to_grid(img)
+    if vmax is None:
+        vmax = float(np.nanmax(grid)) if np.isfinite(grid).any() else 1.0
+    vmax = max(float(vmax), vmin + 1.0)
+
+    fig = plt.figure(figsize=(6.6, 7.4))
+    gs = fig.add_gridspec(1, 2, width_ratios=[24, 1], wspace=0.05,
+                          left=0.11, right=0.87, top=0.855, bottom=0.055)
+    ax = fig.add_subplot(gs[0, 0])
+    ax_cb = fig.add_subplot(gs[0, 1])
+
+    cmap = plt.get_cmap(cmap_name).copy()
+    cmap.set_bad("#e8e8e8")
+    if logscale:
+        norm = matplotlib.colors.LogNorm(vmin=max(vmin, 1.0), vmax=vmax)
+        shown = np.clip(grid, max(vmin, 1.0), None)
+    else:
+        norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+        shown = grid
+
+    im = ax.imshow(np.ma.masked_invalid(shown), origin="lower",
+                   extent=[0, len(COLS), 0, NRING], aspect="auto",
+                   cmap=cmap, norm=norm, interpolation="nearest")
+
+    peak = np.unravel_index(int(np.nanargmax(grid)), grid.shape) \
+        if np.isfinite(grid).any() else None
+    for r in range(NRING):
+        for c in range(len(COLS)):
+            v = grid[r, c]
+            if not np.isfinite(v):
+                ax.text(c + 0.5, r + 0.5, "--", ha="center", va="center",
+                        fontsize=6, color="#8a8a8a")
+                continue
+            ax.text(c + 0.5, r + 0.5, "%.0f" % v, ha="center", va="center",
+                    fontsize=6.5,
+                    color=_text_colour(cmap(norm(max(v, norm.vmin)))))
+            if mark_peak and peak is not None and (r, c) == peak:
+                # the cell the colour scale is pinned to, when vmax is the
+                # per-event maximum
+                ax.add_patch(plt.Rectangle((c, r), 1, 1, fill=False, lw=1.6,
+                                           ec="#00e5ff", zorder=3))
+
+    ax.set_xticks(np.arange(len(COLS)) + 0.5)
+    ax.set_xticklabels(COLS, fontsize=9)
+    ax.xaxis.tick_top()
+    ax.xaxis.set_label_position("top")
+    ax.set_yticks(np.arange(NRING) + 0.5)
+    ax.set_yticklabels([str(RING_LO + i) for i in range(NRING)], fontsize=7)
+    ax.set_ylabel("detector ring", fontsize=9)
+    ax.set_xticks(np.arange(len(COLS) + 1), minor=True)
+    ax.set_yticks(np.arange(NRING + 1), minor=True)
+    ax.grid(which="minor", color="white", lw=0.6)
+    ax.tick_params(which="minor", length=0)
+    ax.tick_params(which="major", length=2)
+
+    cb = fig.colorbar(im, cax=ax_cb)
+    cb.set_label("photons", fontsize=7)
+    cb.ax.tick_params(labelsize=6)
+
+    fig.suptitle(title, fontsize=12, y=0.975)
+    fig.text(0.5, 0.925, subtitle, ha="center", va="top", fontsize=8,
+             color="0.25", linespacing=1.5)
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
 
 
 # ----------------------------------------------------------------------------
@@ -497,6 +598,29 @@ def main(argv=None):
                    help="divide the radiograph density by the solid angle of "
                         "each bin, so the colour is a flux rather than a "
                         "count")
+    p.add_argument("--showEventDisplays", action="store_true",
+                   help="also write one detector image per event that passes "
+                        "every selection -- whatever survived into the input "
+                        "file (trigger, photon and edge cuts from "
+                        "convertDataFile.py) AND the confidence cut here.  "
+                        "They go in INPUT_CNN_displays/, in the style of "
+                        "makeEventDisplays.py, with the CNN's own answer for "
+                        "that event in the subtitle")
+    p.add_argument("--max-displays", type=int, default=MAX_DISPLAYS,
+                   metavar="N",
+                   help="stop after this many event displays (default %d; 0 "
+                        "means every passing event, which on a large file is "
+                        "a lot of png)" % MAX_DISPLAYS)
+    p.add_argument("--display-dir", default=None,
+                   help="where the event displays go (default: "
+                        "INPUT_CNN_displays next to the input file)")
+    p.add_argument("--display-zmax", type=float, default=None, metavar="ADC",
+                   help="fix the top of the event-display colour scale.  "
+                        "DEFAULT is per event: the largest SiPM value in that "
+                        "event, so every display has exactly one cell at the "
+                        "top of the scale, outlined in cyan")
+    p.add_argument("--display-log", action="store_true",
+                   help="logarithmic colour scale on the event displays")
     p.add_argument("--no-pdf", action="store_true")
     p.add_argument("--batch-size", type=int, default=256)
     args = p.parse_args(argv)
@@ -676,6 +800,49 @@ def main(argv=None):
     print("wrote %s" % out_txt)
     for p in paths:
         print("wrote %s" % p)
+
+    # ---- one detector image per surviving event ----
+    if args.showEventDisplays:
+        idx = np.nonzero(m)[0]                  # the events that passed
+        cap = len(idx) if args.max_displays <= 0 \
+            else min(args.max_displays, len(idx))
+        ddir = args.display_dir or (stem + "_CNN_displays")
+        os.makedirs(ddir, exist_ok=True)
+
+        print("-" * 78)
+        print("displays   %d event%s pass every selection; drawing %d of them"
+              % (len(idx), "" if len(idx) == 1 else "s", cap))
+        print("           image  = the 4 x %d photon counts the network was "
+              "given" % NRING)
+        print("           layout = ring %d at the top, ring %d at the bottom, "
+              "columns %s" % (RING_HI, RING_LO, " ".join(COLS)))
+        print("           colour = %s"
+              % ("0 to %g photons (fixed)" % args.display_zmax
+                 if args.display_zmax is not None
+                 else "0 to the largest SiPM in each event (cyan box)"))
+        print("           output %s" % ddir)
+
+        for j, i in enumerate(idx[:cap]):
+            title = "%s   event %d   TrgID %d" % (tag, i, trgid[i])
+            sub = ("CNN:  $\\theta$ = %.1f$^\\circ$,  $\\phi$ = %.1f$^\\circ$,"
+                   "  $|(s,c)|$ = %.3f\n"
+                   "%d photons over %d cells%s"
+                   % (theta[i], phi[i], conf[i], int(images[i].sum()),
+                      NROW * NRING,
+                      "" if args.showTarget is False
+                      else ("   -- IN the target region"
+                            if in_target(theta[i], phi[i], args.target_theta,
+                                         args.target_phi)
+                            else "   -- outside the target region")))
+            out = os.path.join(ddir, "%s_evt%05d_trg%d.png"
+                               % (tag, i, trgid[i]))
+            draw_photon_event(images[i], out, title, sub,
+                              vmax=args.display_zmax,
+                              logscale=args.display_log)
+        print("wrote %d png files to %s" % (cap, ddir))
+        if cap < len(idx):
+            print("           %d passing events were not drawn; raise "
+                  "--max-displays (0 = all)" % (len(idx) - cap))
     print("=" * 78)
     return 0
 
