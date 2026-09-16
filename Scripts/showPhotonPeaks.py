@@ -27,7 +27,9 @@ Output
     RunX_photonPeaks.png                        all four columns overlaid
     RunX_photonPeaks_A.png .. _D.png            one detector column each
     RunX_photonPeaks_all50.png                  the 50 active SiPMs together,
-                                                with the photon-peak fit
+                                                with the photon-peak fit and a
+                                                data/fit ratio panel under it
+                                                (--no-ratio drops the panel)
     RunX_photonPeaks_fit.txt                    the fit report as plain text
 
 The fit
@@ -141,7 +143,7 @@ HG_HI = 200.0
 NBINS = 99
 
 # ---- the photon-peak fit -----------------------------------------------------
-NPEAKS = 4          # Gaussians in the comb: means at P+M, P+2M, ... P+npeaks*M
+NPEAKS = 5          # Gaussians in the comb: means at P+M, P+2M, ... P+npeaks*M
 N_INIT = 35.0       # starting value for the gain M
 SIGMA_INIT = 20.0   # starting width of every peak
 SIGMA_LO = 5.0      # and the window it is allowed to move in
@@ -230,10 +232,11 @@ def run_numbers(path):
 
     The run number may be followed by any number of further numbers joined by
     '_' or '-'; the chain stops at the first non-numeric field ('_list'), so
-    the usual single-run names are unaffected.
+    the usual single-run names are unaffected.  'Runs134_137_list.txt', as
+    written by combineRuns.py, is understood the same way.
     """
     base = os.path.basename(path)
-    m = re.search(r"run[_\-\s]*0*(\d+(?:[_\-]0*\d+)*)", base, re.IGNORECASE)
+    m = re.search(r"runs?[_\-\s]*0*(\d+(?:[_\-]0*\d+)*)", base, re.IGNORECASE)
     if not m:
         return []
     out = []
@@ -245,10 +248,14 @@ def run_numbers(path):
 
 
 def run_stem(path):
-    """The file-name stem: 'Run132_133_137', or the bare name if no match."""
+    """The file-name stem: 'Run125', 'Runs132_133_137', or the bare name.
+
+    Plural for several runs, so the outputs line up with the combined list
+    file combineRuns.py writes ('Runs132_133_137_list.txt').
+    """
     nums = run_numbers(path)
     if nums:
-        return "Run" + "_".join(nums)
+        return ("Run" if len(nums) == 1 else "Runs") + "_".join(nums)
     return os.path.splitext(os.path.basename(path))[0]
 
 
@@ -957,6 +964,37 @@ def print_fit(fit):
 # ----------------------------------------------------------------------------
 # the 50 active SiPMs in one panel
 # ----------------------------------------------------------------------------
+def _extent(fig, ax, artist):
+    """Axes-fraction bbox of an artist, including its bbox patch if it has one.
+
+    A Text drawn with va='top' puts its TEXT top at y, but the rounded box
+    around it extends further up by the box padding -- which is how a block
+    placed just under the legend still lands on top of it.  Measuring the patch
+    is what makes the stacking below honest.
+    """
+    fig.canvas.draw()
+    patch = getattr(artist, "get_bbox_patch", lambda: None)()
+    win = (patch if patch is not None else artist).get_window_extent()
+    return win.transformed(ax.transAxes.inverted())
+
+
+def _bottom_of(fig, ax, artist, pad=0.0):
+    """Axes-fraction y of the bottom of an already-drawn artist, minus pad."""
+    return _extent(fig, ax, artist).y0 - pad
+
+
+def _place_under(fig, ax, ytop, make):
+    """Draw a text with make(y) and slide it down until nothing sticks above.
+
+    Returns the artist, so the next thing can be stacked under its true bottom.
+    """
+    t = make(ytop)
+    over = _extent(fig, ax, t).y1 - ytop
+    if over > 1e-4:
+        t.set_y(ytop - over)
+    return t
+
+
 def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
                logy=False, column="HG", show_individual=False,
                dofit=True, npeaks=NPEAKS, sigma_init=SIGMA_INIT,
@@ -965,8 +1003,8 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
                fit_lo=FIT_LO, fit_hi=None, bkg_mode=BKG_FALLING,
                sig_frac_lo=SIG_FRAC_LO, sig_frac_hi=SIG_FRAC_HI,
                ped_peak=False, ped_init=None, ped_lo=None, ped_hi=None,
-               fix_ped=None):
-    """One axis: the mean spectrum of the active SiPMs, with the comb fit.
+               fix_ped=None, ratio=True):
+    """The mean spectrum of the active SiPMs, the comb fit, and data/fit.
 
     All 50 channels have the same number of entries -- one per event -- so the
     pooled spectrum divided by 50 is the average channel.  With
@@ -976,19 +1014,17 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
     The mean spectrum is fitted with a falling background plus npeaks Gaussians
     at P + M, P + 2M, ... P + npeaks*M, with the pedestal P and the spacing M
     both free.  The fit, its background, the individual peaks, P and the
-    parameters are drawn on top, and the fit dict is returned alongside the
-    usual numbers.
+    parameters are drawn on top, and a data/fit ratio panel is added underneath
+    over the fitted range.  Returns the usual numbers alongside the fit dict.
     """
     edges = np.linspace(lo, hi, nbins + 1)
     centres = 0.5 * (edges[:-1] + edges[1:])
 
-    fig, ax = plt.subplots(figsize=(11.0, 7.0))
-    fig.subplots_adjust(left=0.085, right=0.98, top=0.855, bottom=0.095)
-
+    # ---- accumulate first: whether there is a ratio panel depends on the fit
     pooled = np.zeros(nbins, dtype=float)
+    per_ch = []
     nch = 0
     ntot = 0
-    ymax = 0.0
     seen_cols = []
     for ch in ACTIVE_CH:
         x = vals[ch]
@@ -999,11 +1035,7 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
         nch += 1
         ntot += x.size
         col = CHMAP[ch][1]
-        if show_individual:
-            ax.step(centres, h, where="mid", color=COLCOLOUR[col],
-                    lw=LINEWIDTH, solid_joinstyle="miter", alpha=0.30,
-                    zorder=2)
-            ymax = max(ymax, float(h.max()) if h.size else 0.0)
+        per_ch.append((col, h))
         if col not in seen_cols:
             seen_cols.append(col)
 
@@ -1011,22 +1043,20 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
         sys.exit("no active channels had any entries")
 
     mean = pooled / float(nch)
-    ymax = max(ymax, float(mean.max()))
-    ax.fill_between(centres, mean, step="mid", color="0.2", alpha=0.10,
-                    zorder=3)
-    ax.step(centres, mean, where="mid", color="0.1", lw=1.6,
-            solid_joinstyle="miter", zorder=4,
-            label="mean of the %d SiPMs  (%d entries / %d)" % (nch, ntot, nch))
+    # the mean of nch histograms of Poisson counts
+    err = np.sqrt(np.maximum(pooled, 1.0)) / float(nch)
 
-    # ------------------------------------------------------------------
-    # the fit
-    # ------------------------------------------------------------------
+    # the envelope of everything that gets drawn, for the head-room step below
+    env = mean.copy()
+    if show_individual:
+        for _c, _h in per_ch:
+            env = np.maximum(env, _h)
+
+    # ---- the fit -----------------------------------------------------------
     fit = None
     flo = lo if fit_lo is None else max(lo, float(fit_lo))
     fhi = hi if fit_hi is None else min(hi, float(fit_hi))
     if dofit:
-        # the mean of nch histograms of Poisson counts
-        err = np.sqrt(np.maximum(pooled, 1.0)) / float(nch)
         sel = (centres >= flo) & (centres <= fhi)
         ngauss = npeaks + 1 if ped_peak else npeaks
         i0 = 0 if ped_peak else 1
@@ -1047,21 +1077,56 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
             if fit.get("ok"):
                 fit["fit_lo"], fit["fit_hi"] = float(flo), float(fhi)
 
-    if fit and fit.get("ok"):
+    ok = bool(fit and fit.get("ok"))
+    show_ratio = bool(ratio and ok)
+
+    # ---- the figure: one panel, or spectrum over data/fit -------------------
+    if show_ratio:
+        fig = plt.figure(figsize=(11.0, 8.6))
+        gs = fig.add_gridspec(2, 1, height_ratios=[3.6, 1.0], hspace=0.07,
+                              left=0.085, right=0.98, top=0.885, bottom=0.082)
+        ax = fig.add_subplot(gs[0, 0])
+        axr = fig.add_subplot(gs[1, 0], sharex=ax)
+        ax.tick_params(labelbottom=False)
+        sup_y, sub_y = 0.978, 0.950
+    else:
+        fig, ax = plt.subplots(figsize=(11.0, 7.0))
+        fig.subplots_adjust(left=0.085, right=0.98, top=0.855, bottom=0.095)
+        axr = None
+        sup_y, sub_y = 0.975, 0.935
+
+    ymax = 0.0
+    if show_individual:
+        for col, h in per_ch:
+            ax.step(centres, h, where="mid", color=COLCOLOUR[col],
+                    lw=LINEWIDTH, solid_joinstyle="miter", alpha=0.30,
+                    zorder=2)
+            ymax = max(ymax, float(h.max()) if h.size else 0.0)
+
+    ymax = max(ymax, float(mean.max()))
+    ax.fill_between(centres, mean, step="mid", color="0.2", alpha=0.10,
+                    zorder=3)
+    ax.step(centres, mean, where="mid", color="0.1", lw=1.6,
+            solid_joinstyle="miter", zorder=4,
+            label="mean of the %d SiPMs  (%d entries / %d)" % (nch, ntot, nch))
+
+    if ok:
         gain = fit["gain"]
         ped = fit["ped"]
         i0 = fit.get("i0", 1)
+        means = [ped + (i0 + i) * gain for i in range(fit["npeaks"])]
         xf = np.linspace(flo, fhi, 1000)
         if flo > lo:
             ax.axvspan(lo, flo, color="0.55", alpha=0.10, zorder=0)
             ax.annotate("not fitted", xy=(0.5 * (lo + flo), 0.985),
                         xycoords=("data", "axes fraction"),
                         ha="center", va="top", fontsize=7.5, color="0.45")
+        if fhi < hi:
+            ax.axvspan(fhi, hi, color="0.55", alpha=0.10, zorder=0)
         bkg = fit["p"][0] + fit["p"][1] * xf + fit["p"][2] * xf * xf
 
         # each peak, sitting on the background it was fitted over
-        for i in range(fit["npeaks"]):
-            mu = ped + (i0 + i) * gain
+        for i, mu in enumerate(means):
             g = fit["amp"][i] * np.exp(-0.5 * ((xf - mu) / fit["sig"][i]) ** 2)
             ax.plot(xf, bkg + g, color="#2a78d6", lw=0.9, ls="--", zorder=5,
                     label="single peaks" if i == 0 else None)
@@ -1106,7 +1171,7 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
                    if c in seen_cols]
         handles.append(plt.Line2D([], [], color="0.1", lw=1.6,
                                   label="mean of all %d" % nch))
-        if fit and fit.get("ok"):
+        if ok:
             handles.append(plt.Line2D([], [], color="#cc3311", lw=2.0,
                                       label="fit: background + %d peaks"
                                             % fit["npeaks"]))
@@ -1119,13 +1184,12 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
                                       ls="--", label="single peaks"))
             handles.append(plt.Line2D([], [], color="#117733", lw=1.2,
                                       ls="--", label="pedestal P"))
-        ax.legend(handles=handles, fontsize=8.0, frameon=False,
-                  loc="upper right", labelspacing=0.3)
+        leg = ax.legend(handles=handles, fontsize=8.0, frameon=False,
+                        loc="upper right", labelspacing=0.3)
     else:
-        ax.legend(fontsize=8.0, frameon=False, loc="upper right",
-                  labelspacing=0.3)
+        leg = ax.legend(fontsize=8.0, frameon=False, loc="upper right",
+                        labelspacing=0.3)
 
-    ax.set_xlabel("%s ADC counts" % column, fontsize=11)
     ax.set_ylabel("events / bin, per SiPM", fontsize=11)
     ax.set_xlim(lo, hi)
     if logy:
@@ -1134,38 +1198,125 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
         ax.set_ylim(0, YHEADROOM * ymax if ymax > 0 else 1)
     ax.grid(alpha=0.25, lw=0.5)
     ax.tick_params(labelsize=9)
+    if axr is None:
+        ax.set_xlabel("%s ADC counts" % column, fontsize=11)
 
-    # ---- M, big, because M is the point of the plot; P just under it ----
-    if fit and fit.get("ok"):
-        ax.text(0.985, 0.672,
-                "M = %.2f $\\pm$ %.2f" % (fit["gain"], fit["gain_err"]),
-                transform=ax.transAxes, ha="right", va="top",
-                fontsize=21, fontweight="bold", color="#cc3311", zorder=10,
-                bbox=dict(boxstyle="round,pad=0.45", facecolor="white",
-                          edgecolor="#cc3311", lw=1.6, alpha=0.96))
-        ax.text(0.985, 0.590, "%s ADC counts per photoelectron" % column,
-                transform=ax.transAxes, ha="right", va="top", fontsize=9.5,
-                color="#cc3311", zorder=10)
-        ax.text(0.985, 0.556,
-                ("P = %.2f $\\pm$ %.2f ADC   (pedestal)"
-                 % (fit["ped"], fit["ped_err"])) if fit.get("ped_fitted")
-                else "P = %.2f ADC   (pedestal, fixed)" % fit["ped"],
-                transform=ax.transAxes, ha="right", va="top", fontsize=11,
-                fontweight="bold", color="#117733", zorder=10)
-        ax.text(0.985, 0.513, "\n".join(fit_lines(fit)),
-                transform=ax.transAxes, ha="right", va="top", fontsize=8,
-                family="monospace", color="0.15", zorder=10, linespacing=1.35,
+    # ---- the parameter box top right; the legend, M and P just left of it --
+    # the stats box is placed and measured FIRST, and everything else is then
+    # right-aligned to its left edge, so the two blocks sit side by side in the
+    # middle of the axis instead of one landing on the other
+    guards = []
+    if ok:
+        block = "\n".join(fit_lines(fit))
+        for fs in (8.0, 7.5, 7.0, 6.5, 6.0, 5.5):
+            t = _place_under(fig, ax, 0.982, lambda yy, f=fs: ax.text(
+                0.985, yy, block, transform=ax.transAxes, ha="right",
+                va="top", fontsize=f, family="monospace", color="0.15",
+                zorder=10, linespacing=1.35,
                 bbox=dict(boxstyle="round,pad=0.5", facecolor="white",
-                          edgecolor="0.75", lw=0.8, alpha=0.94))
-    elif fit:
-        ax.text(0.985, 0.672, "fit failed\n%s" % fit.get("why", ""),
-                transform=ax.transAxes, ha="right", va="top", fontsize=10,
-                color="#cc3311", zorder=10,
-                bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
-                          edgecolor="#cc3311", lw=1.2))
+                          edgecolor="0.75", lw=0.8, alpha=0.94)))
+            if _bottom_of(fig, ax, t) > 0.015 or fs == 5.5:
+                break
+            t.remove()
+        stats = _extent(fig, ax, t)
+        guards.append(stats)
 
-    fig.suptitle(title, fontsize=14, y=0.975)
-    fig.text(0.5, 0.935, subtitle, ha="center", va="top", fontsize=9,
+        # right edge of everything else: hard against the stats box, no overlap
+        xr = min(max(stats.x0 - 0.022, 0.32), 0.97)
+        leg.set_bbox_to_anchor((xr, 0.995), transform=ax.transAxes)
+        guards.append(_extent(fig, ax, leg))
+
+        y = _bottom_of(fig, ax, leg, 0.030)
+        t = _place_under(fig, ax, y, lambda yy: ax.text(
+            xr, yy, "M = %.2f $\\pm$ %.2f" % (fit["gain"], fit["gain_err"]),
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=19, fontweight="bold", color="#cc3311", zorder=10,
+            bbox=dict(boxstyle="round,pad=0.38", facecolor="white",
+                      edgecolor="#cc3311", lw=1.6, alpha=0.96)))
+        y = _bottom_of(fig, ax, t, 0.010)
+        t = _place_under(fig, ax, y, lambda yy: ax.text(
+            xr - 0.005, yy, "%s ADC counts per photoelectron" % column,
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=9.5, color="#cc3311", zorder=10))
+        y = _bottom_of(fig, ax, t, 0.014)
+        t = _place_under(fig, ax, y, lambda yy: ax.text(
+            xr - 0.005, yy,
+            ("P = %.2f $\\pm$ %.2f ADC   (pedestal)"
+             % (fit["ped"], fit["ped_err"])) if fit.get("ped_fitted")
+            else "P = %.2f ADC   (pedestal, fixed)" % fit["ped"],
+            transform=ax.transAxes, ha="right", va="top", fontsize=11,
+            fontweight="bold", color="#117733", zorder=10))
+        guards.append(_extent(fig, ax, t))
+    elif fit:
+        guards.append(_extent(fig, ax, leg))
+        t = _place_under(fig, ax, _bottom_of(fig, ax, leg, 0.030), lambda yy:
+                         ax.text(0.985, yy, "fit failed\n%s"
+                                 % fit.get("why", ""),
+                                 transform=ax.transAxes, ha="right", va="top",
+                                 fontsize=10, color="#cc3311", zorder=10,
+                                 bbox=dict(boxstyle="round,pad=0.4",
+                                           facecolor="white",
+                                           edgecolor="#cc3311", lw=1.2)))
+        guards.append(_extent(fig, ax, t))
+    else:
+        guards.append(_extent(fig, ax, leg))
+
+    # ---- head room: lift the y axis until the histogram clears the text ----
+    # the boxes are placed in axes fractions, so this cannot move them; it only
+    # opens space underneath, which beats letting the spectrum run into them
+    if not logy:
+        top = YHEADROOM * ymax if ymax > 0 else 1.0
+        for bb in guards:
+            xlo = lo + max(bb.x0, 0.0) * (hi - lo)
+            xhi = lo + min(bb.x1, 1.0) * (hi - lo)
+            m = (centres >= xlo) & (centres <= xhi)
+            if not m.any() or bb.y0 <= 0.10:
+                continue
+            need = float(env[m].max()) / (bb.y0 - 0.025)
+            top = max(top, min(need, 1.5 * ymax if ymax > 0 else need))
+        ax.set_ylim(0, top)
+
+    # ---- data / fit --------------------------------------------------------
+    if show_ratio:
+        sel = (centres >= flo) & (centres <= fhi)
+        mod = peak_model(centres[sel], fit["p"], fit["npeaks"], fit["ped"],
+                         fit.get("i0", 1))
+        good = mod > 0
+        xr = centres[sel][good]
+        rr = mean[sel][good] / mod[good]
+        re_ = err[sel][good] / mod[good]
+
+        if flo > lo:
+            axr.axvspan(lo, flo, color="0.55", alpha=0.10, zorder=0)
+        if fhi < hi:
+            axr.axvspan(fhi, hi, color="0.55", alpha=0.10, zorder=0)
+        for mu in means:
+            axr.axvline(mu, color="#2a78d6", lw=0.7, ls=":", alpha=0.55,
+                        zorder=1)
+        axr.axhline(1.0, color="#cc3311", lw=1.5, zorder=3)
+        axr.errorbar(xr, rr, yerr=re_, fmt="o", ms=2.8, lw=0.0, elinewidth=0.8,
+                     capsize=0, color="0.12", ecolor="0.45", zorder=4)
+
+        # a window that shows the structure without one outlier setting it
+        spread = float(np.percentile(np.abs(rr - 1.0), 98)) if rr.size else 0.1
+        half = min(max(1.35 * spread, 0.03), 0.60)
+        axr.set_ylim(1.0 - half, 1.0 + half)
+        for lev in (1.0 - 0.5 * half, 1.0 + 0.5 * half):
+            axr.axhline(lev, color="0.7", lw=0.6, ls=":", zorder=2)
+        axr.set_ylabel("data / fit", fontsize=10)
+        axr.set_xlabel("%s ADC counts" % column, fontsize=11)
+        axr.set_xlim(lo, hi)
+        axr.grid(alpha=0.25, lw=0.5)
+        axr.tick_params(labelsize=9)
+        nout = int(np.sum(np.abs(rr - 1.0) > half))
+        if nout:
+            axr.annotate("%d point%s off scale" % (nout, "" if nout == 1
+                                                   else "s"),
+                         xy=(0.995, 0.06), xycoords="axes fraction",
+                         ha="right", va="bottom", fontsize=7.5, color="0.45")
+
+    fig.suptitle(title, fontsize=14, y=sup_y)
+    fig.text(0.5, sub_y, subtitle, ha="center", va="top", fontsize=9,
              color="0.25", linespacing=1.5)
     for path in out_paths:
         fig.savefig(path, dpi=DPI)
@@ -1282,6 +1433,9 @@ def main(argv=None):
     p.add_argument("--allow-negative-bkg", action="store_true",
                    help="let the polynomial background go negative as well as "
                         "rise: a completely unconstrained quadratic")
+    p.add_argument("--no-ratio", action="store_true",
+                   help="do not add the data/fit ratio panel under the "
+                        "all-50 spectrum")
     p.add_argument("--no-pdf", action="store_true",
                    help="only write the pngs, not the matching pdfs")
     p.add_argument("--no-txt", action="store_true",
@@ -1423,7 +1577,8 @@ def main(argv=None):
             sig_frac_lo=args.sigma_min_frac,
             sig_frac_hi=args.sigma_max_frac, ped_peak=args.ped_peak,
             ped_init=args.ped_init, ped_lo=args.ped_min,
-            ped_hi=args.ped_max, fix_ped=args.fix_ped)
+            ped_hi=args.ped_max, fix_ped=args.fix_ped,
+            ratio=not args.no_ratio)
         print("all50      %d SiPMs, %d entries pooled (%d per SiPM)"
               % (nch, nent, nent // nch if nch else 0))
         if not args.logy:
