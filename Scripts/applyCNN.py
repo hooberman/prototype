@@ -217,6 +217,27 @@ def image_to_grid(img):
     return np.asarray(img, dtype=float).T[::-1, :]
 
 
+def write_event_text(img, out_txt, trgid, theta, phi, conf):
+    """One event as a small text file: a header line, then the 4 x 11 array.
+
+        TrigID  theta  phi  phi_confidence
+        <4 rows of 11 photon counts>
+
+    The array is written in the SAME orientation convertDataFile.py used --
+    rows are detector columns A, B, C, D and array column 0 is ring 15 -- so
+    it can be read back with the same code that reads the input file.  Note
+    that is the transpose of the picture draw_photon_event() makes.
+
+    No comment lines: the header is exactly the four numbers asked for, so
+    the file parses with a bare loadtxt/split.
+    """
+    a = np.asarray(img, dtype=float)
+    with open(out_txt, "w") as f:
+        f.write("%d %.4f %.4f %.4f\n" % (int(trgid), theta, phi, conf))
+        for row in a:
+            f.write(" ".join("%d" % int(round(v)) for v in row) + "\n")
+
+
 def draw_photon_event(img, out_png, title, subtitle, vmin=0.0, vmax=None,
                       cmap_name=CMAP, logscale=False, mark_peak=True):
     """One event's 4 x 11 photon image, in makeEventDisplays.py's style.
@@ -606,13 +627,22 @@ def main(argv=None):
                         "They go in INPUT_CNN_displays/, in the style of "
                         "makeEventDisplays.py, with the CNN's own answer for "
                         "that event in the subtitle")
+    p.add_argument("--printTextFiles", action="store_true",
+                   help="also write one text file per selected event -- the "
+                        "same events --showEventDisplays draws, in the same "
+                        "directory.  Each holds a header line 'TrigID theta "
+                        "phi phi_confidence' followed by the 4 x %d photon "
+                        "array.  Works with or without --showEventDisplays"
+                        % NRING)
     p.add_argument("--max-displays", type=int, default=MAX_DISPLAYS,
                    metavar="N",
-                   help="stop after this many event displays (default %d; 0 "
-                        "means every passing event, which on a large file is "
-                        "a lot of png)" % MAX_DISPLAYS)
+                   help="stop after this many events for BOTH "
+                        "--showEventDisplays and --printTextFiles, so the two "
+                        "sets match one for one (default %d; 0 means every "
+                        "passing event, which on a large file is a lot of "
+                        "files)" % MAX_DISPLAYS)
     p.add_argument("--display-dir", default=None,
-                   help="where the event displays go (default: "
+                   help="where the event displays and text files go (default: "
                         "INPUT_CNN_displays next to the input file)")
     p.add_argument("--display-zmax", type=float, default=None, metavar="ADC",
                    help="fix the top of the event-display colour scale.  "
@@ -801,47 +831,74 @@ def main(argv=None):
     for p in paths:
         print("wrote %s" % p)
 
-    # ---- one detector image per surviving event ----
-    if args.showEventDisplays:
+    # ---- per-event output: images, text files, or both ----
+    # one selection, one cap, one directory, so the two sets line up
+    if args.showEventDisplays or args.printTextFiles:
         idx = np.nonzero(m)[0]                  # the events that passed
         cap = len(idx) if args.max_displays <= 0 \
             else min(args.max_displays, len(idx))
         ddir = args.display_dir or (stem + "_CNN_displays")
         os.makedirs(ddir, exist_ok=True)
 
+        wants = [w for w, on in (("displays", args.showEventDisplays),
+                                 ("text files", args.printTextFiles)) if on]
         print("-" * 78)
-        print("displays   %d event%s pass every selection; drawing %d of them"
-              % (len(idx), "" if len(idx) == 1 else "s", cap))
-        print("           image  = the 4 x %d photon counts the network was "
+        print("per-event  %d event%s pass every selection; writing %s for %d "
+              "of them"
+              % (len(idx), "" if len(idx) == 1 else "s",
+                 " and ".join(wants), cap))
+        print("           content = the 4 x %d photon counts the network was "
               "given" % NRING)
-        print("           layout = ring %d at the top, ring %d at the bottom, "
-              "columns %s" % (RING_HI, RING_LO, " ".join(COLS)))
-        print("           colour = %s"
-              % ("0 to %g photons (fixed)" % args.display_zmax
-                 if args.display_zmax is not None
-                 else "0 to the largest SiPM in each event (cyan box)"))
-        print("           output %s" % ddir)
+        if args.showEventDisplays:
+            print("           image   ring %d at the top, ring %d at the "
+                  "bottom, columns %s"
+                  % (RING_HI, RING_LO, " ".join(COLS)))
+            print("           colour  %s"
+                  % ("0 to %g photons (fixed)" % args.display_zmax
+                     if args.display_zmax is not None
+                     else "0 to the largest SiPM in each event (cyan box)"))
+        if args.printTextFiles:
+            print("           text    line 1 = TrigID theta phi "
+                  "phi_confidence, then the 4 x %d array" % NRING)
+            print("                   array as STORED (rows = columns %s, "
+                   "array column 0 = ring %d),"
+                  % (",".join(COLS), RING_HI))
+            print("                   i.e. the same orientation as the input "
+                  "file, not the picture")
+        print("           output  %s" % ddir)
 
-        for j, i in enumerate(idx[:cap]):
-            title = "%s   event %d   TrgID %d" % (tag, i, trgid[i])
-            sub = ("CNN:  $\\theta$ = %.1f$^\\circ$,  $\\phi$ = %.1f$^\\circ$,"
-                   "  $|(s,c)|$ = %.3f\n"
-                   "%d photons over %d cells%s"
-                   % (theta[i], phi[i], conf[i], int(images[i].sum()),
-                      NROW * NRING,
-                      "" if args.showTarget is False
-                      else ("   -- IN the target region"
-                            if in_target(theta[i], phi[i], args.target_theta,
-                                         args.target_phi)
-                            else "   -- outside the target region")))
-            out = os.path.join(ddir, "%s_evt%05d_trg%d.png"
-                               % (tag, i, trgid[i]))
-            draw_photon_event(images[i], out, title, sub,
-                              vmax=args.display_zmax,
-                              logscale=args.display_log)
-        print("wrote %d png files to %s" % (cap, ddir))
+        npng = ntxt = 0
+        for i in idx[:cap]:
+            base = "%s_evt%05d_trg%d" % (tag, i, trgid[i])
+            if args.showEventDisplays:
+                title = "%s   event %d   TrgID %d" % (tag, i, trgid[i])
+                sub = ("CNN:  $\\theta$ = %.1f$^\\circ$,  $\\phi$ = "
+                       "%.1f$^\\circ$,  $|(s,c)|$ = %.3f\n"
+                       "%d photons over %d cells%s"
+                       % (theta[i], phi[i], conf[i], int(images[i].sum()),
+                          NROW * NRING,
+                          "" if args.showTarget is False
+                          else ("   -- IN the target region"
+                                if in_target(theta[i], phi[i],
+                                             args.target_theta,
+                                             args.target_phi)
+                                else "   -- outside the target region")))
+                draw_photon_event(images[i],
+                                  os.path.join(ddir, base + ".png"),
+                                  title, sub, vmax=args.display_zmax,
+                                  logscale=args.display_log)
+                npng += 1
+            if args.printTextFiles:
+                write_event_text(images[i], os.path.join(ddir, base + ".txt"),
+                                 trgid[i], theta[i], phi[i], conf[i])
+                ntxt += 1
+
+        if npng:
+            print("wrote %d png files to %s" % (npng, ddir))
+        if ntxt:
+            print("wrote %d txt files to %s" % (ntxt, ddir))
         if cap < len(idx):
-            print("           %d passing events were not drawn; raise "
+            print("           %d passing events were not written; raise "
                   "--max-displays (0 = all)" % (len(idx) - cap))
     print("=" * 78)
     return 0
