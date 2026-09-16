@@ -5,10 +5,14 @@ eventDisplay3D.py
 Interactive 3-D event display for the SiPM cylinder prototype, built on
 PyVista / VTK.
 
-    python eventDisplay3D.py EVENT.txt                 # interactive window
-    python eventDisplay3D.py EVENTDIR/*.txt            # n / p step events
-    python eventDisplay3D.py EVENT.txt --html out.html # standalone web page
-    python eventDisplay3D.py EVENT.txt --html site/    # a page per event + index
+    python eventDisplay3D.py EVENTS.txt                # interactive window
+    python eventDisplay3D.py EVENTDIR/*.txt            # several files at once
+    python eventDisplay3D.py EVENTS.txt --html out.html   # standalone web page
+    python eventDisplay3D.py EVENTS.txt --html site/      # a page per event
+
+The window opens on the bare detector, with no event in it.  Right loads the
+first event, Right again steps forward, Left steps back, and Left from the
+first event returns to the empty detector.
 
 Mouse
 -----
@@ -19,17 +23,23 @@ Mouse
 
 Keys
 ----
-    n / p        next / previous event (when several files are given)
+    Right / n    next event  (from the setup view, load the first event)
+    Left  / p    previous event, back to the setup view
+    Home         the setup view again
     r            reset the camera
     s / w        surface / wireframe
     q            quit
 
 Input
 -----
-The per-event text files applyCNN.py --printTextFiles writes:
+One file holds any number of events, five lines each, as applyCNN.py
+--printTextFiles writes them:
 
     TrigID  theta  phi  phi_confidence  [t0 t1 t2 t3]
     <4 rows of 11 photon counts>
+
+so a 5-event file is 25 lines.  Blank lines and #-comments are skipped, and
+several files can be given at once; they are concatenated in order.
 
 Rows are detector columns A, B, C, D; array column 0 is ring 15 and column 10
 is ring 5, exactly as convertDataFile.py stores them.
@@ -43,12 +53,14 @@ Trigger telescope
 -----------------
 Four 5 x 5 x 1 cm channels, the 1 cm axis radial about the track's axis
 crossing at z = TRACK_Z0, in two facing pairs on the accepted-muon direction
-theta = 50, phi = 0.  The distance, 14.18 cm, is set so the 5 cm face spans
-40 < theta < 60.  At that distance the face sits at cylindrical radius
-10.86 cm and so spans phi = -12.96 to +12.96 rather than the +/-8.5 asked for;
-a square face always subtends MORE in phi than in theta, because the phi lever
-arm is d*sin(theta) and the theta lever arm is d.  Getting +/-8.5 would need a
-3.25 cm width.  --trig-distance overrides the placement.
+theta = 50, phi = 0, 17 cm out from the pivot (--trig-distance).  Each is a
+tape-wrapped scintillator on a board of the same 5 x 5 footprint, with the
+OLED and the LED flush on the board's outer face.
+
+At 17 cm the face spans theta 41.6 to 58.4 and phi -10.9 to +10.9.  A square
+face always subtends MORE in phi than in theta -- the phi lever arm is
+d*sin(theta), the theta lever arm is d -- so no distance gives both 40-60 in
+theta and +/-8.5 in phi at once; +/-8.5 would need the width cut to 3.9 cm.
 
 Geometry
 --------
@@ -155,12 +167,9 @@ TRIG_THICK = 1.0             # 1 cm, along the radial direction
 TRIG_PAIR_GAP = 0.60         # between the two units of a pair
 TRIG_THETA = 50.0            # accepted direction: theta at the centre
 TRIG_PHI = 0.0               # ... and phi
-TRIG_DTHETA = 20.0           # full theta acceptance, i.e. 40 < theta < 60
+TRIG_DIST = 17.0             # pivot to the centre of each pair
 TRIG_ADC_MAX = 1024.0        # Arduino analogRead full scale
 TRIG_LED_ON = 500.0          # LED lights above this
-
-# The distance that makes the 5 cm face span TRIG_DTHETA in theta.
-TRIG_DIST = (TRIG_SIZE / 2.0) / np.tan(np.radians(TRIG_DTHETA / 2.0))
 
 CW_TAPE = "#141414"          # electrical tape over the scintillator
 CW_PCB = "#1d6b46"           # the CosmicWatch board
@@ -204,38 +213,63 @@ GLOW = LinearSegmentedColormap.from_list("glow", [
 # ----------------------------------------------------------------------------
 # input
 # ----------------------------------------------------------------------------
-def read_event(path, nrow=4, nring=NRING_DATA):
-    """applyCNN.py --printTextFiles output -> dict."""
+def read_events(path, nrow=4, nring=NRING_DATA):
+    """Every event in one file -> list of dicts.
+
+    A file is a stack of (1 + nrow)-line blocks, so it holds one event or a
+    thousand with no change of format.  Blank lines and #-comments are
+    dropped first, which is what lets a hand-edited file still parse.
+    """
+    block = 1 + nrow
     with open(path) as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
-    if len(lines) < 1 + nrow:
-        sys.exit("%s: expected %d lines, found %d" % (path, 1 + nrow,
-                                                      len(lines)))
-    h = lines[0].split()
-    if len(h) < 4:
-        sys.exit("%s: header should be 'TrigID theta phi phi_confidence "
-                 "[t0 t1 t2 t3]'" % path)
-    trig = None
-    if len(h) >= 4 + N_TRIG:
-        trig = np.array([float(x) for x in h[4:4 + N_TRIG]], dtype=float)
-    elif len(h) > 4:
-        sys.exit("%s: header has %d extra values after phi_confidence, "
-                 "expected %d trigger ADC values" % (path, len(h) - 4, N_TRIG))
-    counts = []
-    for r in range(nrow):
-        v = lines[1 + r].split()
-        if len(v) != nring:
-            sys.exit("%s line %d: %d values, expected %d"
-                     % (path, r + 2, len(v), nring))
-        counts.append([float(x) for x in v])
-    return {"path": path,
-            "name": os.path.splitext(os.path.basename(path))[0],
-            "trgid": int(float(h[0])),
-            "theta": float(h[1]),
-            "phi": float(h[2]),
-            "conf": float(h[3]),
-            "trig": trig,
-            "counts": np.asarray(counts, dtype=float)}
+        lines = [ln.strip() for ln in f
+                 if ln.strip() and not ln.lstrip().startswith("#")]
+    if not lines:
+        sys.exit("%s: no events found" % path)
+    if len(lines) % block:
+        sys.exit("%s: %d content lines is not a whole number of %d-line "
+                 "events (%d left over)"
+                 % (path, len(lines), block, len(lines) % block))
+
+    base = os.path.splitext(os.path.basename(path))[0]
+    nev = len(lines) // block
+    events = []
+    for k in range(nev):
+        off = k * block
+        h = lines[off].split()
+        if len(h) < 4:
+            sys.exit("%s line %d: header should be 'TrigID theta phi "
+                     "phi_confidence [t0 t1 t2 t3]'" % (path, off + 1))
+        trig = None
+        if len(h) >= 4 + N_TRIG:
+            trig = np.array([float(x) for x in h[4:4 + N_TRIG]], dtype=float)
+        elif len(h) > 4:
+            sys.exit("%s line %d: %d extra values after phi_confidence, "
+                     "expected %d trigger ADC values"
+                     % (path, off + 1, len(h) - 4, N_TRIG))
+        counts = []
+        for r in range(nrow):
+            v = lines[off + 1 + r].split()
+            if len(v) != nring:
+                sys.exit("%s line %d: %d values, expected %d"
+                         % (path, off + r + 2, len(v), nring))
+            counts.append([float(x) for x in v])
+        trgid = int(float(h[0]))
+        events.append({"path": path,
+                       "name": base if nev == 1
+                               else "%s_evt%03d_trg%d" % (base, k, trgid),
+                       "trgid": trgid,
+                       "theta": float(h[1]),
+                       "phi": float(h[2]),
+                       "conf": float(h[3]),
+                       "trig": trig,
+                       "counts": np.asarray(counts, dtype=float)})
+    return events
+
+
+def read_event(path, **kw):
+    """The first event in a file, for callers that want just one."""
+    return read_events(path, **kw)[0]
 
 
 # ----------------------------------------------------------------------------
@@ -473,57 +507,30 @@ def cosmicwatch_meshes(centre, w, value, outer=True):
     add(pv.Cube(center=(0, 0, 0), x_length=TRIG_THICK, y_length=s, z_length=s),
         color=CW_TAPE, smooth_shading=False, specular=0.55, specular_power=18,
         ambient=0.22, diffuse=0.75)
-    # a thin lighter band, so the tape reads as tape and not as a void
-    add(pv.Cube(center=(0, 0, -0.3), x_length=TRIG_THICK * 1.01,
-                y_length=s * 1.005, z_length=0.45),
-        color="#232323", smooth_shading=False, specular=0.8,
-        specular_power=30, ambient=0.25)
 
-    add(pv.Cube(center=(0, 0, 0.5 * s + 0.02), x_length=TRIG_THICK * 1.03,
-                y_length=s * 1.015, z_length=0.05),
-        color="#3c4349", smooth_shading=True, specular=1.0,
-        specular_power=75, ambient=0.28)
-
-    # ---- the board it sits on ----
-    # the board is TRIG_SIZE + 3.1 long, flush with the top of the
-    # scintillator and sticking out 3.1 cm below it, where the OLED goes
-    zb = -0.5 * s - 1.55                       # OLED centre
-    add(pv.Cube(center=(0.62, 0.0, -1.55),
-                x_length=0.18, y_length=s * 1.08, z_length=s + 3.1),
+    # ---- the board underneath, truncated at the 5 x 5 face ----
+    add(pv.Cube(center=(0.5 * TRIG_THICK + 0.11, 0.0, 0.0),
+                x_length=0.22, y_length=s, z_length=s),
         color=CW_PCB, smooth_shading=True, specular=0.4, specular_power=22,
         ambient=0.22)
 
-    # ---- OLED breakout on the outer face, near the bottom ----
-    add(pv.Cube(center=(0.85, -0.85, zb), x_length=0.28, y_length=3.2,
-                z_length=2.4),
-        color=CW_OLED, smooth_shading=True, specular=0.5, specular_power=25,
-        ambient=0.25)
-    add(pv.Cube(center=(1.03, -0.85, zb - 0.12), x_length=0.12, y_length=2.7,
-                z_length=1.7),
+    # ---- OLED and LED, flush on the board's outer face ----
+    add(pv.Cube(center=(0.5 * TRIG_THICK + 0.27, -0.75, -1.45),
+                x_length=0.12, y_length=2.4, z_length=1.5),
         color=screen_colour(value), smooth_shading=False, ambient=0.95,
         diffuse=0.25, specular=0.6, specular_power=60)
-
-    # ---- indicator LED ----
     lit = value is not None and value > TRIG_LED_ON
-    led = pv.Cylinder(center=(0.95, 1.85, zb), direction=(1, 0, 0),
-                      radius=0.26, height=0.6, resolution=18)
-    add(led, color=CW_LED_ON if lit else CW_LED_OFF, smooth_shading=True,
+    add(pv.Cylinder(center=(0.5 * TRIG_THICK + 0.32, 1.55, -1.45),
+                    direction=(1, 0, 0), radius=0.26, height=0.5,
+                    resolution=18),
+        color=CW_LED_ON if lit else CW_LED_OFF, smooth_shading=True,
         ambient=1.0 if lit else 0.30, diffuse=0.2 if lit else 0.8,
         specular=1.0, specular_power=70, opacity=1.0 if lit else 0.65)
     if lit:                                    # a soft bloom, as on the SiPMs
-        add(pv.Sphere(radius=0.68, center=(1.08, 1.85, zb)),
+        add(pv.Sphere(radius=0.62, center=(0.5 * TRIG_THICK + 0.42, 1.55,
+                                           -1.45)),
             color=CW_LED_ON, opacity=0.18, ambient=1.0, diffuse=0.0,
             specular=0.0)
-
-    # ---- BNC out of the end of the board ----
-    add(pv.Cube(center=(0.62, 0.5 * s * 1.08 + 0.35, zb + 1.5),
-                x_length=0.95, y_length=0.85, z_length=0.95),
-        color="#17181a", smooth_shading=True, specular=0.6, specular_power=30)
-    add(pv.Cylinder(center=(0.62, 0.5 * s * 1.08 + 1.15, zb + 1.5),
-                    direction=(0, 1, 0), radius=0.26, height=0.8,
-                    resolution=18),
-        color=CW_SILVER, smooth_shading=True, specular=1.0, specular_power=80,
-        ambient=0.20)
     return parts
 
 
@@ -613,6 +620,31 @@ def light_azimuth(counts):
     return np.degrees(np.arctan2(y, x)) % 360.0
 
 
+def setup_text(nev, trig_dist, track_z0, triggers=True):
+    """The panel shown before any event is loaded."""
+    lines = ["DETECTOR SETUP",
+             "",
+             "scint    cylinder %.1f cm dia x %.0f cm" % (2 * R_CYL, H_CYL),
+             "boards   %s at %s deg"
+             % ("/".join(COLS), "/".join("%.0f" % COL_PHI[c] for c in COLS)),
+             "SiPMs    %d per board, %.2f cm pitch" % (N_RING, SIPM_PITCH),
+             "         rings %d-%d read out (%d)"
+             % (RING_LO, RING_HI, NRING_DATA)]
+    if triggers:
+        rho = trig_dist * np.sin(np.radians(TRIG_THETA))
+        dt = np.degrees(np.arctan(TRIG_SIZE / 2.0 / trig_dist))
+        dp = np.degrees(np.arctan(TRIG_SIZE / 2.0 / rho))
+        lines += ["trigger  %d CosmicWatch, %g x %g x %g cm"
+                  % (N_TRIG, TRIG_SIZE, TRIG_SIZE, TRIG_THICK),
+                  "         %.1f cm from (0,0,%g) on theta %g phi %g"
+                  % (trig_dist, track_z0, TRIG_THETA, TRIG_PHI),
+                  "         theta %.1f-%.1f, phi %+.1f to %+.1f"
+                  % (TRIG_THETA - dt, TRIG_THETA + dt, -dp, dp)]
+    lines += ["", "%d event%s loaded" % (nev, "" if nev == 1 else "s"),
+              "press Right to show the first"]
+    return "\n".join(lines)
+
+
 def hud_text(ev, counts, phi_sense="to"):
     tot = int(counts.sum())
     hot = np.unravel_index(int(np.argmax(counts)), counts.shape)
@@ -645,7 +677,7 @@ class Display:
                  phi_sense="to", compass=True, track_z0=TRACK_Z0,
                  triggers=True, trig_dist=TRIG_DIST):
         self.events = events
-        self.i = 0
+        self.i = -1                              # -1 = the bare detector
         self.cmap = cmap
         self.zmax = zmax
         self.log = logscale
@@ -684,9 +716,11 @@ class Display:
 
         self.pl.add_axes(color=HUD, line_width=3, labels_off=False,
                          xlabel="x", ylabel="y", zlabel="z")
-        if len(events) > 1:
-            self.pl.add_key_event("n", self.next)
-            self.pl.add_key_event("p", self.prev)
+        for key in ("Right", "n"):
+            self.pl.add_key_event(key, self.next)
+        for key in ("Left", "p"):
+            self.pl.add_key_event(key, self.prev)
+        self.pl.add_key_event("Home", self.setup)
         self.draw()
         self.home_view()
         self.pl.add_key_event("r", self.home_view)
@@ -718,12 +752,21 @@ class Display:
         self.pl.render()
 
     # -- event switching ---------------------------------------------------
+    # The index runs -1, 0, 1, ... len-1, where -1 is the empty detector.  It
+    # clamps rather than wraps: stepping past the last event should not drop
+    # you back at the first without noticing.
     def next(self):
-        self.i = (self.i + 1) % len(self.events)
-        self.draw()
+        if self.i < len(self.events) - 1:
+            self.i += 1
+            self.draw()
 
     def prev(self):
-        self.i = (self.i - 1) % len(self.events)
+        if self.i > -1:
+            self.i -= 1
+            self.draw()
+
+    def setup(self):
+        self.i = -1
         self.draw()
 
     def draw(self):
@@ -733,6 +776,10 @@ class Display:
             except Exception:
                 pass
         self.dynamic = []
+
+        if self.i < 0:
+            self.draw_setup()
+            return
 
         ev = self.events[self.i]
         counts = ev["counts"]
@@ -799,12 +846,35 @@ class Display:
             hud_text(ev, counts, self.phi_sense),
             position="upper_left", font_size=11,
             color=HUD, font="courier", shadow=True))
-        foot = ev["name"]
-        if len(self.events) > 1:
-            foot = "[%d/%d]  %s   (n = next, p = previous)" \
-                % (self.i + 1, len(self.events), foot)
+        foot = "[%d/%d]  %s   (Right = next, Left = previous)" \
+            % (self.i + 1, len(self.events), ev["name"])
         self.dynamic.append(self.pl.add_text(
             foot, position="lower_left", font_size=8, color="#5d7d8a",
+            font="courier"))
+        self.pl.render()
+
+    def draw_setup(self):
+        """The bare detector: no muon, no light, no phi needle."""
+        dark = build_sipms(np.zeros((len(COLS), NRING_DATA)))
+        self.dynamic.append(self.pl.add_mesh(
+            dark, color=DEAD, reset_camera=False, smooth_shading=True,
+            specular=0.3, ambient=0.25, show_scalar_bar=False))
+
+        if self.triggers:
+            for c, w, outer in self.trig_placements():
+                for mesh, style in cosmicwatch_meshes(c, w, None, outer):
+                    self.dynamic.append(self.pl.add_mesh(
+                        mesh, reset_camera=False, show_scalar_bar=False,
+                        **style))
+
+        self.dynamic.append(self.pl.add_text(
+            setup_text(len(self.events), self.trig_dist, self.track_z0,
+                       self.triggers),
+            position="upper_left", font_size=11, color=HUD, font="courier",
+            shadow=True))
+        self.dynamic.append(self.pl.add_text(
+            "[setup]   no event loaded   (Right = first event)",
+            position="lower_left", font_size=8, color="#5d7d8a",
             font="courier"))
         self.pl.render()
 
@@ -861,8 +931,9 @@ def main(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("eventfiles", nargs="+",
-                   help="event text files (applyCNN.py --printTextFiles), or "
-                        "a directory of them")
+                   help="event text files (applyCNN.py --printTextFiles), "
+                        "each holding any number of 5-line events, or a "
+                        "directory of them")
     p.add_argument("--html", default=None, metavar="PATH",
                    help="write a standalone web page instead of opening a "
                         "window.  A path ending in .html writes the first "
@@ -881,11 +952,11 @@ def main(argv=None):
     p.add_argument("--no-halo", action="store_true",
                    help="turn off the soft glow around the bright SiPMs")
     p.add_argument("--phi-sense", choices=("to", "from"), default="to",
-                   help="what phi means for the drawn track.  'from' (default)"
-                        " = the muon arrives from azimuth phi, entering high "
-                        "on the phi side, which is the sense that matches the "
-                        "training MC.  'to' = it travels towards phi, i.e. the"
-                        " same line rotated 180 deg in azimuth")
+                   help="what phi means for the drawn track.  'to' "
+                        "(default) = the muon travels towards azimuth phi, "
+                        "leaving low on the phi side, which is the sense the "
+                        "data supports.  'from' = it arrives from phi, i.e. "
+                        "the same line rotated 180 deg in azimuth")
     p.add_argument("--track-z", type=float, default=TRACK_Z0,
                    metavar="CM", help="height at which the drawn track crosses"
                         " the detector axis, in cm (default %g).  The impact "
@@ -895,9 +966,8 @@ def main(argv=None):
                    help="hide the four CosmicWatch trigger channels")
     p.add_argument("--trig-distance", type=float, default=TRIG_DIST,
                    metavar="CM", help="distance from the track's axis crossing"
-                        " to each trigger pair, in cm (default %.2f, the "
-                        "distance at which a %g cm face spans %g deg in theta)"
-                        % (TRIG_DIST, TRIG_SIZE, TRIG_DTHETA))
+                        " to the centre of each trigger pair, in cm "
+                        "(default %g)" % TRIG_DIST)
     p.add_argument("--no-compass", action="store_true",
                    help="hide the brass bearing ring, its A/B/C/D board tags "
                         "and the gold phi needle")
@@ -916,11 +986,16 @@ def main(argv=None):
     if not paths:
         sys.exit("no event files found")
 
-    events = [read_event(q) for q in paths]
+    events = []
+    for q in paths:
+        events += read_events(q)
+    if not events:
+        sys.exit("no events found")
     cmap = args.cmap or GLOW
 
     print("=" * 70)
-    print("events     %d" % len(events))
+    print("events     %d in %d file%s"
+          % (len(events), len(paths), "" if len(paths) == 1 else "s"))
     print("detector   cylinder %.1f cm diameter x %.0f cm, 4 boards at "
           "%s deg" % (2 * R_CYL, H_CYL,
                       "/".join("%.0f" % COL_PHI[c] for c in COLS)))
@@ -942,13 +1017,14 @@ def main(argv=None):
           % ("ARRIVES FROM" if args.phi_sense == "from" else "TRAVELS TO",
              args.phi_sense))
     print("-" * 70)
-    print("  %-18s %8s %8s   %s" % ("event", "phi_CNN", "phi_light",
-                                    "board totals  " +
-                                    " ".join("%5s" % c for c in COLS)))
+    w = max(18, max(len(e["name"]) for e in events))
+    print("  %-*s %8s %9s   %s" % (w, "event", "phi_CNN", "phi_light",
+                                   "board totals  " +
+                                   " ".join("%5s" % c for c in COLS)))
     for e in events:
         bt = e["counts"].sum(axis=1)
-        print("  %-18s %8.2f %8.2f                 %s"
-              % (e["name"], e["phi"], light_azimuth(e["counts"]),
+        print("  %-*s %8.2f %9.2f                 %s"
+              % (w, e["name"], e["phi"], light_azimuth(e["counts"]),
                  " ".join("%5d" % v for v in bt)))
     print("-" * 70)
 
@@ -958,6 +1034,10 @@ def main(argv=None):
                 halo=not args.no_halo, phi_sense=args.phi_sense,
                 compass=not args.no_compass, track_z0=args.track_z,
                 triggers=not args.no_triggers, trig_dist=args.trig_distance)
+
+    if off:
+        d.i = 0                      # a still or a web page wants an event
+        d.draw()
 
     if args.screenshot:
         d.screenshot(args.screenshot)
@@ -983,11 +1063,11 @@ def main(argv=None):
     if not off:
         print("mouse      left = rotate, scroll = zoom, middle/shift+left = "
               "pan")
-        if len(events) > 1:
-            print("keys       n = next event, p = previous, r = reset camera, "
-                  "q = quit")
-        else:
-            print("keys       r = reset camera, q = quit")
+        print("keys       Right = next event, Left = previous, "
+              "Home = setup view,")
+        print("           r = reset camera, q = quit")
+        print("view       opens on the bare detector; Right loads event 1 "
+              "of %d" % len(events))
         print("=" * 70)
         d.show()
     else:
