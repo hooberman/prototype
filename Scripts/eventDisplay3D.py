@@ -14,6 +14,16 @@ The window opens on the bare detector, with no event in it.  Right loads the
 first event, Right again steps forward, Left steps back, and Left from the
 first event returns to the empty detector.
 
+Layout
+------
+Three viewports.  The middle one holds the detector, and the HUD, the x/y/z
+triad and the photon colour bar all sit inside it, next to the detector rather
+than out at the window edges.  Left is the 4 x 11 photon map of the event on
+screen; right is the theta-phi radiograph, with the trigger acceptance shaded
+and one dot for this event.  Both side panels are drawn as their viewport's
+background, so they stay flat and still while the detector is rotated, zoomed
+or panned.  --no-panels drops them and gives the detector the whole window.
+
 Mouse
 -----
     left drag    rotate
@@ -121,6 +131,7 @@ import argparse
 import glob
 import os
 import sys
+import tempfile
 
 import numpy as np
 import pyvista as pv
@@ -410,7 +421,7 @@ def build_halo(counts, frac=0.12):
     return pv.MultiBlock(blocks).combine() if blocks else None
 
 
-def muon_meshes(theta_deg, phi_deg, length=19.0, phi_sense="to", z0=TRACK_Z0):
+def muon_meshes(theta_deg, phi_deg, length=23.0, phi_sense="to", z0=TRACK_Z0):
     """The muon as a line through the detector axis at z0, plus an arrow head.
 
     theta is the zenith angle (0 = straight down the axis) and phi the
@@ -578,6 +589,30 @@ def compass_labels():
     return np.asarray(pos), txt
 
 
+def axes_triad_meshes(length=2.3):
+    """A small x/y/z triad parked outside the bearing ring.
+
+    VTK's orientation-marker widget is drawn by a renderer of its own, and in
+    a multi-viewport window it intermittently comes out zoomed to a solid
+    block, so the triad is ordinary scene geometry instead.  It sits at the
+    ring, right under the detector, which is where it is wanted anyway.
+    """
+    _, z, rr = compass_meshes()
+    o = np.array([-rr * 0.88, -rr * 0.88, z])
+    parts, pos, txt = [], [], []
+    for d, col, lab in (((1, 0, 0), "#ff6b5e", "x"),
+                        ((0, 1, 0), "#7ee06a", "y"),
+                        ((0, 0, 1), "#6fa8ff", "z")):
+        parts.append((pv.Arrow(start=o, direction=d, scale=length,
+                               tip_length=0.26, tip_radius=0.085,
+                               shaft_radius=0.028),
+                      dict(color=col, smooth_shading=True, ambient=0.55,
+                           diffuse=0.55, specular=0.7, specular_power=40)))
+        pos.append(o + np.array(d, dtype=float) * (length * 1.22))
+        txt.append(lab)
+    return parts, np.asarray(pos), txt
+
+
 def phi_pointer(phi_deg):
     """The gold needle on the bearing ring, laid along azimuth phi."""
     _, z, rr = compass_meshes()
@@ -618,6 +653,142 @@ def light_azimuth(counts):
     if x == 0.0 and y == 0.0:
         return float("nan")
     return np.degrees(np.arctan2(y, x)) % 360.0
+
+
+# ----------------------------------------------------------------------------
+# the two flat side panels
+#
+# These are matplotlib figures drawn as the background image of their own
+# viewport, rather than as geometry in the scene.  That is what keeps them
+# square to the screen and the same size no matter how the detector is
+# rotated, zoomed or panned.
+# ----------------------------------------------------------------------------
+# The window is split into three viewports: the flat 4 x 11 map on the left,
+# the 3-D scene in the middle, the radiograph on the right.  The panels are
+# drawn as that viewport's background image, which is what keeps them square
+# to the screen and fixed while the detector is rotated, zoomed or panned.
+PANEL_WEIGHTS = (1.0, 2.1, 1.0)
+PANEL_DPI = 100.0
+
+# the trigger acceptance drawn as the shaded wedge on the radiograph
+BAND_THETA = (40.0, 60.0)
+BAND_PHI = (-8.5, 8.5)
+BAND_FILL = "#6ba6dd"
+EVENT_DOT = "#ff5b39"
+
+
+
+def _panel_figure(figsize, dpi=100):
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=figsize, dpi=dpi)
+    fig.patch.set_facecolor(BG_LOW)
+    fig.patch.set_alpha(0.0)
+    return fig
+
+
+def _style_axes(ax, colour=HUD):
+    ax.set_facecolor("none")
+    for sp in ax.spines.values():
+        sp.set_color(colour)
+        sp.set_linewidth(0.8)
+    ax.tick_params(colors=colour, labelsize=8, length=3, width=0.8)
+    ax.yaxis.label.set_color(colour)
+    ax.xaxis.label.set_color(colour)
+    ax.title.set_color(colour)
+
+
+def panel_grid_figure(counts, cmap, figsize, title=None, vmax=None):
+    """The 4 x 11 photon map, ring 15 at the top, exactly as the data is
+    stored.  Cells carry their value; the hottest one gets a cyan box."""
+    from matplotlib.patches import Rectangle
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    img = np.asarray(counts).T                  # (ring, column)
+    top = float(vmax) if vmax else max(1.0, float(img.max()))
+    fig = _panel_figure(figsize)
+    ax = fig.add_axes([0.17, 0.045, 0.60, 0.845])
+    _style_axes(ax)
+    norm = Normalize(0.0, top)
+    ax.imshow(img, cmap=cmap, norm=norm, aspect="auto", origin="upper",
+              interpolation="nearest")
+
+    ax.set_xticks(range(len(COLS)))
+    ax.set_xticklabels(COLS, fontsize=11)
+    ax.xaxis.set_ticks_position("top")
+    ax.set_yticks(range(NRING_DATA))
+    ax.set_yticklabels([str(RING_HI - k) for k in range(NRING_DATA)],
+                       fontsize=8)
+    ax.set_ylabel("detector ring", fontsize=9)
+    ax.set_xticks(np.arange(-0.5, len(COLS), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, NRING_DATA, 1), minor=True)
+    ax.grid(which="minor", color=BG_HIGH, linewidth=0.8)
+    ax.tick_params(which="minor", length=0)
+
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    for r in range(NRING_DATA):
+        for c in range(len(COLS)):
+            v = img[r, c]
+            rgb = sm.to_rgba(v)[:3]
+            lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+            ax.text(c, r, "%d" % round(v), ha="center", va="center",
+                    fontsize=7.5, color="#101010" if lum > 0.6 else "#e8f4f8")
+    if img.max() > 0:                            # nothing to point at when empty
+        hot = np.unravel_index(int(np.argmax(img)), img.shape)
+        ax.add_patch(Rectangle((hot[1] - 0.5, hot[0] - 0.5), 1, 1, fill=False,
+                               edgecolor=MUON, linewidth=2.0))
+
+    cax = fig.add_axes([0.81, 0.045, 0.045, 0.845])
+    cb = fig.colorbar(sm, cax=cax)
+    cb.set_label("photons", color=HUD, fontsize=9)
+    cb.ax.tick_params(colors=HUD, labelsize=7.5)
+    cb.outline.set_edgecolor(HUD)
+    if title:
+        fig.text(0.5, 0.965, title, ha="center", va="top", color=HUD,
+                 fontsize=9, family="monospace")
+    return fig
+
+
+def panel_radiograph_figure(theta=None, phi=None, figsize=(4.5, 4.5)):
+    """theta vs phi on a polar plot, with the trigger acceptance shaded.
+
+    One red dot, for the event on screen -- this is a per-event readout of
+    where the muon sits in the acceptance, not a population plot.
+    """
+    fig = _panel_figure(figsize)
+    w, h = fig.get_size_inches()
+    side = min(0.84, 0.84 * w / h)               # keep the dial round
+    ax = fig.add_axes([0.5 - side * h / w / 2.0, 0.5 - side / 2.0,
+                       side * h / w, side], projection="polar")
+    ax.set_facecolor("none")
+    ax.set_ylim(0, 80)
+    ax.set_rgrids(range(10, 80, 10),
+                  labels=["%d" % v for v in range(10, 80, 10)],
+                  color="#e8f4f8", fontsize=7.5, angle=112.5)
+    ax.set_thetagrids(range(0, 360, 45),
+                      labels=["%d°" % v for v in range(0, 360, 45)],
+                      color=HUD, fontsize=8)
+    ax.grid(color="#2c4356", linewidth=0.7)
+    ax.spines["polar"].set_color(HUD)
+
+    a = np.radians(np.linspace(BAND_PHI[0], BAND_PHI[1], 60))
+    ax.fill_between(a, BAND_THETA[0], BAND_THETA[1], color=BAND_FILL,
+                    alpha=0.45, edgecolor=BAND_FILL, linewidth=1.0)
+
+    if theta is not None and phi is not None:
+        ax.plot([np.radians(phi)], [min(float(theta), 80.0)], "o",
+                color=EVENT_DOT, markersize=7,
+                markeredgecolor="#ffd0c4", markeredgewidth=0.8, zorder=5)
+
+    fig.text(0.5, 0.5 + side / 2.0 + 0.055, "theta vs phi radiograph",
+             ha="center", va="bottom", color=HUD, fontsize=9,
+             family="monospace")
+    fig.text(0.5, 0.5 + side / 2.0 + 0.028,
+             "trigger: %g-%g deg theta, %+g to %+g deg phi"
+             % (BAND_THETA[0], BAND_THETA[1], BAND_PHI[0], BAND_PHI[1]),
+             ha="center", va="bottom", color="#5d7d8a", fontsize=7.5,
+             family="monospace")
+    return fig
 
 
 def setup_text(nev, trig_dist, track_z0, triggers=True):
@@ -675,7 +846,7 @@ class Display:
     def __init__(self, events, cmap=GLOW, zmax=None, logscale=False,
                  off_screen=False, window_size=(1280, 960), halo=True,
                  phi_sense="to", compass=True, track_z0=TRACK_Z0,
-                 triggers=True, trig_dist=TRIG_DIST):
+                 triggers=True, trig_dist=TRIG_DIST, panels=True):
         self.events = events
         self.i = -1                              # -1 = the bare detector
         self.cmap = cmap
@@ -687,11 +858,20 @@ class Display:
         self.triggers = triggers
         self.trig_dist = float(trig_dist)
         self.compass = compass
+        self.panels = panels
+        self.window_size = tuple(window_size)
+        self._tmp = tempfile.mkdtemp(prefix="evd3d_")
         self.dynamic = []                        # actors to clear each event
 
+        shape = (1, 3) if panels else (1, 1)
+        kw = dict(col_weights=list(PANEL_WEIGHTS), border=False) if panels \
+            else {}
         self.pl = pv.Plotter(off_screen=off_screen, window_size=window_size,
-                             lighting="none")
-        self.pl.set_background(BG_LOW, top=BG_HIGH)
+                             lighting="none", shape=shape, **kw)
+        for c in range(shape[1]):
+            self.pl.subplot(0, c)
+            self.pl.set_background(BG_LOW, top=BG_HIGH)
+        self.mid()
         for mesh, style in build_detector():
             self.pl.add_mesh(mesh, **style)
         if self.compass:
@@ -709,13 +889,25 @@ class Display:
             self.pl.enable_depth_peeling(number_of_peels=8)
         except Exception:
             pass
-        try:
-            self.pl.enable_anti_aliasing("ssaa")
-        except Exception:
-            pass
+        # SSAA renders at double size, which makes VTK drop the side
+        # viewports' background images entirely.  FXAA costs a little sharpness
+        # but composites correctly, so it is what the panelled layout uses.
+        for mode in (("fxaa",) if panels else ("ssaa", "fxaa")):
+            try:
+                self.pl.enable_anti_aliasing(mode)
+                break
+            except Exception:
+                continue
 
-        self.pl.add_axes(color=HUD, line_width=3, labels_off=False,
-                         xlabel="x", ylabel="y", zlabel="z")
+        # the orientation marker, the HUD and the colour bar all live in the
+        # middle band of the window, between the two flat panels, so they read
+        # as labels on the detector rather than as window furniture
+        tri, tpos, ttxt = axes_triad_meshes()
+        for mesh, style in tri:
+            self.pl.add_mesh(mesh, reset_camera=False, **style)
+        self.pl.add_point_labels(tpos, ttxt, font_size=13, text_color=HUD,
+                                 shape=None, show_points=False,
+                                 always_visible=True)
         for key in ("Right", "n"):
             self.pl.add_key_event(key, self.next)
         for key in ("Left", "p"):
@@ -725,22 +917,54 @@ class Display:
         self.home_view()
         self.pl.add_key_event("r", self.home_view)
 
+    # -- viewports ---------------------------------------------------------
+    def mid(self):
+        """Make the 3-D viewport active.  Every camera, light, actor and text
+        call below acts on whichever renderer is current, so this has to be
+        the first thing any of them does."""
+        if self.panels:
+            self.pl.subplot(0, 1)
+
+    def panel_px(self, which):
+        """Pixel size of a side viewport, so the matplotlib figure can be made
+        at exactly that aspect and fill it without letterboxing."""
+        w, h = self.window_size
+        tot = float(sum(PANEL_WEIGHTS))
+        return (w * PANEL_WEIGHTS[0 if which == "left" else 2] / tot, float(h))
+
+    def panel_figsize(self, which):
+        px = self.panel_px(which)
+        return (px[0] / PANEL_DPI, px[1] / PANEL_DPI)
+
+    def show_panel(self, col, fig):
+        path = os.path.join(self._tmp, "panel%d.png" % col)
+        fig.savefig(path, dpi=PANEL_DPI, facecolor=BG_LOW)
+        self.pl.subplot(0, col)
+        try:
+            self.pl.remove_background_image()
+        except Exception:
+            pass
+        self.pl.add_background_image(path, as_global=False)
+        self.mid()
+
     def trig_placements(self):
         return trig_placements(self.phi_sense, self.track_z0, self.trig_dist)
 
     def home_view(self):
         """Three-quarter view framed on the detector, not on the track.
 
+
         reset_camera() would fit the muon line as well, which is twice as long
         as the cylinder and would leave the detector tiny in the middle.
         """
+        self.mid()
         self.pl.camera_position = [(1.35, -1.15, 0.58), (0, 0, 0), (0, 0, 1)]
         z_top = ring_z(N_RING - 1) + 5.1          # the connector end
         z_bot = z_top - PCB_LEN
         rad = R_PCB * 2.0
         if self.compass:
             _, z_c, r_c = compass_meshes()
-            rad = max(rad, r_c + 1.6)
+            rad = max(rad, r_c * 0.88 + 3.2)
             z_bot = min(z_bot, z_c - 1.0)
         if self.triggers:
             for c, _w, _o in self.trig_placements():
@@ -769,7 +993,44 @@ class Display:
         self.i = -1
         self.draw()
 
+    def draw_panels(self, ev=None, counts=None, vmax=None):
+        """Left: the 4 x 11 map.  Right: the radiograph with one dot for the
+        event on screen.  Both are viewport backgrounds, so the camera never
+        touches them."""
+        if not self.panels:
+            return
+        if counts is None:
+            counts = np.zeros((len(COLS), NRING_DATA))
+        title = ("TrgID %d   theta %.1f   phi %.1f   conf %.3f"
+                 % (ev["trgid"], ev["theta"], ev["phi"], ev["conf"])
+                 if ev else "no event loaded")
+        self.show_panel(0, panel_grid_figure(counts, self.cmap,
+                                             self.panel_figsize("left"),
+                                             title=title, vmax=vmax))
+        self.show_panel(2, panel_radiograph_figure(
+            ev["theta"] if ev else None, ev["phi"] if ev else None,
+            self.panel_figsize("right")))
+
+    def draw_panels(self, ev=None, counts=None, vmax=None):
+        """Left: the 4 x 11 map.  Right: the radiograph with one dot for the
+        event on screen.  Both are viewport backgrounds, so the camera never
+        touches them."""
+        if not self.panels:
+            return
+        if counts is None:
+            counts = np.zeros((len(COLS), NRING_DATA))
+        title = ("TrgID %d   theta %.1f   phi %.1f   conf %.3f"
+                 % (ev["trgid"], ev["theta"], ev["phi"], ev["conf"])
+                 if ev else "no event loaded")
+        self.show_panel(0, panel_grid_figure(counts, self.cmap,
+                                             self.panel_figsize("left"),
+                                             title=title, vmax=vmax))
+        self.show_panel(2, panel_radiograph_figure(
+            ev["theta"] if ev else None, ev["phi"] if ev else None,
+            self.panel_figsize("right")))
+
     def draw(self):
+        self.mid()
         for a in self.dynamic:
             try:
                 self.pl.remove_actor(a, render=False)
@@ -786,6 +1047,8 @@ class Display:
         vmax = self.zmax if self.zmax else max(float(counts.max()), 1.0)
         clim = (max(1.0, 0.0) if self.log else 0.0, vmax)
 
+        self.draw_panels(ev, counts, vmax if self.zmax else None)
+
         tiles = build_sipms(counts)
         self.dynamic.append(self.pl.add_mesh(
             tiles, scalars="photons", cmap=self.cmap, clim=clim,
@@ -795,7 +1058,7 @@ class Display:
             show_scalar_bar=True,
             scalar_bar_args=dict(title="photons", color=HUD, n_labels=6,
                                  vertical=True, width=0.035, height=0.42,
-                                 position_x=0.905, position_y=0.30,
+                                 position_x=0.875, position_y=0.30,
                                  title_font_size=15, label_font_size=12,
                                  fmt="%.0f")))
 
@@ -855,6 +1118,8 @@ class Display:
 
     def draw_setup(self):
         """The bare detector: no muon, no light, no phi needle."""
+        self.mid()
+        self.draw_panels(None, None)
         dark = build_sipms(np.zeros((len(COLS), NRING_DATA)))
         self.dynamic.append(self.pl.add_mesh(
             dark, color=DEAD, reset_camera=False, smooth_shading=True,
@@ -870,8 +1135,8 @@ class Display:
         self.dynamic.append(self.pl.add_text(
             setup_text(len(self.events), self.trig_dist, self.track_z0,
                        self.triggers),
-            position="upper_left", font_size=11, color=HUD, font="courier",
-            shadow=True))
+            position="upper_left", font_size=11, color=HUD,
+            font="courier", shadow=True))
         self.dynamic.append(self.pl.add_text(
             "[setup]   no event loaded   (Right = first event)",
             position="lower_left", font_size=8, color="#5d7d8a",
@@ -968,10 +1233,13 @@ def main(argv=None):
                    metavar="CM", help="distance from the track's axis crossing"
                         " to the centre of each trigger pair, in cm "
                         "(default %g)" % TRIG_DIST)
+    p.add_argument("--no-panels", action="store_true",
+                   help="hide the two flat side panels (the 4 x 11 photon map "
+                        "on the left, the theta-phi radiograph on the right)")
     p.add_argument("--no-compass", action="store_true",
                    help="hide the brass bearing ring, its A/B/C/D board tags "
                         "and the gold phi needle")
-    p.add_argument("--size", type=int, nargs=2, default=[1280, 960],
+    p.add_argument("--size", type=int, nargs=2, default=[1800, 950],
                    metavar=("W", "H"), help="window / image size")
     args = p.parse_args(argv)
 
@@ -1033,7 +1301,8 @@ def main(argv=None):
                 off_screen=off, window_size=tuple(args.size),
                 halo=not args.no_halo, phi_sense=args.phi_sense,
                 compass=not args.no_compass, track_z0=args.track_z,
-                triggers=not args.no_triggers, trig_dist=args.trig_distance)
+                triggers=not args.no_triggers, trig_dist=args.trig_distance,
+                panels=not args.no_panels)
 
     if off:
         d.i = 0                      # a still or a web page wants an event
