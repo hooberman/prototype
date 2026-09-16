@@ -36,6 +36,7 @@ Keys
     Right / n    next event  (from the setup view, load the first event)
     Left  / p    previous event, back to the setup view
     Home         the setup view again
+    Return       save the window as <event>.png and <event>.pdf
     r            reset the camera
     s / w        surface / wireframe
     q            quit
@@ -487,45 +488,52 @@ def trig_placements(phi_sense="to", z0=TRACK_Z0, dist=TRIG_DIST,
     return out
 
 
-def cosmicwatch_meshes(centre, w, value, outer=True):
-    """One CosmicWatch-styled channel as (mesh, style) pairs.
-
-    Built in a local frame -- x radial (the 1 cm axis), y azimuthal, z polar --
-    then rotated onto (w, t, s) and translated to `centre`.  The board is put
-    on the far face of each unit so a pair shows its two scintillators meeting
-    in the middle, the way they sit on the bench.
-    """
+def _cw_frame(centre, w, outer):
+    """The 4x4 that maps the local frame -- x radial (the 1 cm axis), y
+    azimuthal, z polar -- onto the channel's place in the world."""
     w = np.asarray(w, dtype=float)
     w = w / np.linalg.norm(w)
-    ex = w if outer else -w                    # local +x
+    ex = w if outer else -w
     zhat = np.array([0.0, 0.0, 1.0])
     ey = np.cross(zhat, ex)
     if np.linalg.norm(ey) < 1e-9:
         ey = np.array([0.0, 1.0, 0.0])
     ey /= np.linalg.norm(ey)
-    ez = np.cross(ex, ey)
     M = np.eye(4)
-    M[:3, 0], M[:3, 1], M[:3, 2] = ex, ey, ez
+    M[:3, 0], M[:3, 1], M[:3, 2] = ex, ey, np.cross(ex, ey)
     M[:3, 3] = centre
+    return M
 
+
+def cosmicwatch_body(centre, w, outer=True):
+    """The parts of a channel that never change: the taped scintillator and
+    the board behind it.  Static, so stepping through events does not rebuild
+    the telescope."""
+    M = _cw_frame(centre, w, outer)
     s = TRIG_SIZE
     parts = []
 
     def add(mesh, **style):
         parts.append((mesh.transform(M, inplace=False), style))
 
-    # ---- scintillator, wrapped in black tape ----
     add(pv.Cube(center=(0, 0, 0), x_length=TRIG_THICK, y_length=s, z_length=s),
         color=CW_TAPE, smooth_shading=False, specular=0.55, specular_power=18,
         ambient=0.22, diffuse=0.75)
-
-    # ---- the board underneath, truncated at the 5 x 5 face ----
     add(pv.Cube(center=(0.5 * TRIG_THICK + 0.11, 0.0, 0.0),
                 x_length=0.22, y_length=s, z_length=s),
         color=CW_PCB, smooth_shading=True, specular=0.4, specular_power=22,
         ambient=0.22)
+    return parts
 
-    # ---- OLED and LED, flush on the board's outer face ----
+
+def cosmicwatch_readout(centre, w, value, outer=True):
+    """The OLED and the LED, which are the only per-event parts."""
+    M = _cw_frame(centre, w, outer)
+    parts = []
+
+    def add(mesh, **style):
+        parts.append((mesh.transform(M, inplace=False), style))
+
     add(pv.Cube(center=(0.5 * TRIG_THICK + 0.27, -0.75, -1.45),
                 x_length=0.12, y_length=2.4, z_length=1.5),
         color=screen_colour(value), smooth_shading=False, ambient=0.95,
@@ -538,8 +546,8 @@ def cosmicwatch_meshes(centre, w, value, outer=True):
         ambient=1.0 if lit else 0.30, diffuse=0.2 if lit else 0.8,
         specular=1.0, specular_power=70, opacity=1.0 if lit else 0.65)
     if lit:                                    # a soft bloom, as on the SiPMs
-        add(pv.Sphere(radius=0.62, center=(0.5 * TRIG_THICK + 0.42, 1.55,
-                                           -1.45)),
+        add(pv.Sphere(radius=0.62,
+                      center=(0.5 * TRIG_THICK + 0.42, 1.55, -1.45)),
             color=CW_LED_ON, opacity=0.18, ambient=1.0, diffuse=0.0,
             specular=0.0)
     return parts
@@ -597,8 +605,8 @@ def axes_triad_meshes(length=2.3):
     block, so the triad is ordinary scene geometry instead.  It sits at the
     ring, right under the detector, which is where it is wanted anyway.
     """
-    _, z, rr = compass_meshes()
-    o = np.array([-rr * 0.88, -rr * 0.88, z])
+    _, z, _rr = compass_meshes()
+    o = np.array([0.0, 0.0, z - 3.4])            # directly below the detector
     parts, pos, txt = [], [], []
     for d, col, lab in (((1, 0, 0), "#ff6b5e", "x"),
                         ((0, 1, 0), "#7ee06a", "y"),
@@ -681,8 +689,11 @@ EVENT_DOT = "#ff5b39"
 def _panel_figure(figsize, dpi=100):
     from matplotlib.figure import Figure
     fig = Figure(figsize=figsize, dpi=dpi)
+    # Opaque, deliberately.  A transparent panel composites over whatever the
+    # viewport held last frame instead of covering it, which is what doubled
+    # up the titles and the colour-bar ticks.
     fig.patch.set_facecolor(BG_LOW)
-    fig.patch.set_alpha(0.0)
+    fig.patch.set_alpha(1.0)
     return fig
 
 
@@ -846,7 +857,8 @@ class Display:
     def __init__(self, events, cmap=GLOW, zmax=None, logscale=False,
                  off_screen=False, window_size=(1280, 960), halo=True,
                  phi_sense="to", compass=True, track_z0=TRACK_Z0,
-                 triggers=True, trig_dist=TRIG_DIST, panels=True):
+                 triggers=True, trig_dist=TRIG_DIST, panels=True,
+                 savedir="."):
         self.events = events
         self.i = -1                              # -1 = the bare detector
         self.cmap = cmap
@@ -861,6 +873,10 @@ class Display:
         self.panels = panels
         self.window_size = tuple(window_size)
         self._tmp = tempfile.mkdtemp(prefix="evd3d_")
+        self._bg = {}                            # background renderer per side
+        self._saved = 0
+        self._last_ws = tuple(window_size)
+        self.savedir = savedir
         self.dynamic = []                        # actors to clear each event
 
         shape = (1, 3) if panels else (1, 1)
@@ -902,6 +918,12 @@ class Display:
         # the orientation marker, the HUD and the colour bar all live in the
         # middle band of the window, between the two flat panels, so they read
         # as labels on the detector rather than as window furniture
+        if self.triggers:
+            for c, w, outer in trig_placements(phi_sense, self.track_z0,
+                                               self.trig_dist):
+                for mesh, style in cosmicwatch_body(c, w, outer):
+                    self.pl.add_mesh(mesh, reset_camera=False, **style)
+
         tri, tpos, ttxt = axes_triad_meshes()
         for mesh, style in tri:
             self.pl.add_mesh(mesh, reset_camera=False, **style)
@@ -913,9 +935,30 @@ class Display:
         for key in ("Left", "p"):
             self.pl.add_key_event(key, self.prev)
         self.pl.add_key_event("Home", self.setup)
+        for key in ("Return", "KP_Enter"):
+            self.pl.add_key_event(key, self.save_view)
         self.draw()
         self.home_view()
         self.pl.add_key_event("r", self.home_view)
+
+        # the panel figures are built at the viewport's pixel size, so a
+        # resized window needs them rebuilt or they letterbox and leave stale
+        # pixels down the sides
+        if not off_screen and self.panels:
+            try:
+                self.pl.iren.add_observer("ModifiedEvent", self._on_resize)
+            except Exception:
+                pass
+
+    def _on_resize(self, *args):
+        try:
+            ws = tuple(self.pl.window_size)
+        except Exception:
+            return
+        if max(abs(ws[0] - self._last_ws[0]), abs(ws[1] - self._last_ws[1])) < 8:
+            return
+        self._last_ws = ws
+        self.draw()
 
     # -- viewports ---------------------------------------------------------
     def mid(self):
@@ -928,7 +971,10 @@ class Display:
     def panel_px(self, which):
         """Pixel size of a side viewport, so the matplotlib figure can be made
         at exactly that aspect and fill it without letterboxing."""
-        w, h = self.window_size
+        try:
+            w, h = self.pl.window_size
+        except Exception:
+            w, h = self.window_size
         tot = float(sum(PANEL_WEIGHTS))
         return (w * PANEL_WEIGHTS[0 if which == "left" else 2] / tot, float(h))
 
@@ -937,14 +983,37 @@ class Display:
         return (px[0] / PANEL_DPI, px[1] / PANEL_DPI)
 
     def show_panel(self, col, fig):
+        """Draw a panel figure into its viewport's background.
+
+        pyvista's remove_background_image() clears the renderer's actors but
+        leaves the renderer attached to the render window, so add/remove per
+        event stacks one panel on top of the last -- which is what doubled up
+        the tick labels and the frame.  The background renderer is therefore
+        created once and its image swapped in place afterwards.
+        """
         path = os.path.join(self._tmp, "panel%d.png" % col)
-        fig.savefig(path, dpi=PANEL_DPI, facecolor=BG_LOW)
-        self.pl.subplot(0, col)
-        try:
-            self.pl.remove_background_image()
-        except Exception:
-            pass
-        self.pl.add_background_image(path, as_global=False)
+        fig.savefig(path, dpi=PANEL_DPI, facecolor=BG_LOW,
+                    transparent=False)
+        bg = self._bg.get(col)
+        if bg is None:
+            self.pl.subplot(0, col)
+            self.pl.add_background_image(path, as_global=False)
+            idx = self.pl.renderers.active_index
+            self._bg[col] = self.pl.renderers._background_renderers[idx]
+        else:
+            try:
+                img = pv.read(path, cls=pv.ImageData)
+                bg._actors["background"].SetInputData(img)
+                bg.resize()
+            except Exception:                    # fall back to a rebuild
+                self.pl.subplot(0, col)
+                try:
+                    self.pl.remove_background_image()
+                except Exception:
+                    pass
+                self.pl.add_background_image(path, as_global=False)
+                idx = self.pl.renderers.active_index
+                self._bg[col] = self.pl.renderers._background_renderers[idx]
         self.mid()
 
     def trig_placements(self):
@@ -964,8 +1033,8 @@ class Display:
         rad = R_PCB * 2.0
         if self.compass:
             _, z_c, r_c = compass_meshes()
-            rad = max(rad, r_c * 0.88 + 3.2)
-            z_bot = min(z_bot, z_c - 1.0)
+            rad = max(rad, r_c + 1.6)
+            z_bot = min(z_bot, z_c - 6.2)
         if self.triggers:
             for c, _w, _o in self.trig_placements():
                 rad = max(rad, abs(c[0]) + 4.0, abs(c[1]) + 4.0)
@@ -1075,7 +1144,7 @@ class Display:
             vals = ev.get("trig")
             for k, (c, w, outer) in enumerate(self.trig_placements()):
                 v = None if vals is None else float(vals[k])
-                for mesh, style in cosmicwatch_meshes(c, w, v, outer):
+                for mesh, style in cosmicwatch_readout(c, w, v, outer):
                     self.dynamic.append(self.pl.add_mesh(
                         mesh, reset_camera=False, show_scalar_bar=False,
                         **style))
@@ -1127,7 +1196,7 @@ class Display:
 
         if self.triggers:
             for c, w, outer in self.trig_placements():
-                for mesh, style in cosmicwatch_meshes(c, w, None, outer):
+                for mesh, style in cosmicwatch_readout(c, w, None, outer):
                     self.dynamic.append(self.pl.add_mesh(
                         mesh, reset_camera=False, show_scalar_bar=False,
                         **style))
@@ -1144,6 +1213,38 @@ class Display:
         self.pl.render()
 
     # -- outputs -----------------------------------------------------------
+    def save_view(self):
+        """Write what is on screen to PNG and PDF, side by side.
+
+        The PDF wraps the rendered pixels rather than going through GL2PS:
+        vector export drops the viewport background images, which would lose
+        both side panels, and the point of the button is to capture exactly
+        what the window shows.
+        """
+        stem = self.events[self.i]["name"] if self.i >= 0 else "setup"
+        stem = os.path.join(self.savedir, stem)
+        path = stem
+        n = 0
+        while os.path.exists(path + ".png") or os.path.exists(path + ".pdf"):
+            n += 1
+            path = "%s_%d" % (stem, n)
+        self.pl.screenshot(path + ".png")
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.image import imread
+            arr = imread(path + ".png")
+            h, w = arr.shape[:2]
+            fig = Figure(figsize=(w / 150.0, h / 150.0), dpi=150)
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.imshow(arr, interpolation="nearest")
+            ax.set_axis_off()
+            fig.savefig(path + ".pdf", dpi=150, facecolor=BG_LOW)
+            print("saved %s.png and %s.pdf" % (path, path))
+        except Exception as exc:                 # PNG is still on disk
+            print("saved %s.png (PDF failed: %s)" % (path, exc))
+        self._saved += 1
+        self.draw()          # the capture leaves a stale frame in the panels
+
     def show(self):
         self.pl.show(title="SiPM cylinder -- event display")
 
@@ -1233,6 +1334,9 @@ def main(argv=None):
                    metavar="CM", help="distance from the track's axis crossing"
                         " to the centre of each trigger pair, in cm "
                         "(default %g)" % TRIG_DIST)
+    p.add_argument("--savedir", default=".", metavar="DIR",
+                   help="where Return writes its PNG and PDF (default: the "
+                        "current directory)")
     p.add_argument("--no-panels", action="store_true",
                    help="hide the two flat side panels (the 4 x 11 photon map "
                         "on the left, the theta-phi radiograph on the right)")
@@ -1302,7 +1406,7 @@ def main(argv=None):
                 halo=not args.no_halo, phi_sense=args.phi_sense,
                 compass=not args.no_compass, track_z0=args.track_z,
                 triggers=not args.no_triggers, trig_dist=args.trig_distance,
-                panels=not args.no_panels)
+                panels=not args.no_panels, savedir=args.savedir)
 
     if off:
         d.i = 0                      # a still or a web page wants an event
@@ -1334,7 +1438,8 @@ def main(argv=None):
               "pan")
         print("keys       Right = next event, Left = previous, "
               "Home = setup view,")
-        print("           r = reset camera, q = quit")
+        print("           Return = save PNG + PDF to %s, r = reset camera, "
+              "q = quit" % os.path.abspath(args.savedir))
         print("view       opens on the bare detector; Right loads event 1 "
               "of %d" % len(events))
         print("=" * 70)
