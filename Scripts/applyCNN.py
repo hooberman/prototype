@@ -64,9 +64,7 @@ import matplotlib.pyplot as plt
 warnings.simplefilter("ignore", FutureWarning)
 
 # ----------------------------------------------------------------------------
-MODEL_DIR = ("/Users/benhoob/ScintillatorAI/plots/"
-             "sipm_hits_PoC_v2p2_1Mevents_1-100_CNN_1000photons_innerRing3/"
-             "ResNet2_sincos_nTiles2_nSiPM2_mV10_5epochs/model")
+MODEL_DIR = ("/Users/benhoob/ScintillatorAI/plots/sipm_hits_PoC_4p85Mevents_runs1-485_CNN_1000photons_innerRing3/ResNet2_sincos_nTiles2_nSiPM2_mV10_5epochs/model")
 # ----------------------------------------------------------------------------
 
 NROW = 4                # detector columns A, B, C, D
