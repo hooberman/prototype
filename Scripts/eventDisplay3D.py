@@ -55,18 +55,18 @@ several files can be given at once; they are concatenated in order.
 Rows are detector columns A, B, C, D; array column 0 is ring 15 and column 10
 is ring 5, exactly as convertDataFile.py stores them.
 
-t0..t3 are optional CosmicWatch trigger ADC values, 0 to 1024.  Each drives
-one channel's OLED colour on the same ramp as the SiPMs, and lights its LED
-above 500.  Channels are numbered along the muon's path: 0 and 1 are the upper
-pair (outer unit first), 2 and 3 the lower pair (inner unit first).
+t0..t3 are optional CosmicWatch trigger ADC values, 0 to 1024.  They are
+printed in the HUD, starred above 500; the channels themselves are static
+geometry and carry no per-event readout.  Channels are numbered along the
+muon's path: 0 and 1 are the upper pair (outer unit first), 2 and 3 the lower
+pair (inner unit first).
 
 Trigger telescope
 -----------------
 Four 5 x 5 x 1 cm channels, the 1 cm axis radial about the track's axis
 crossing at z = TRACK_Z0, in two facing pairs on the accepted-muon direction
 theta = 50, phi = 0, 17 cm out from the pivot (--trig-distance).  Each is a
-tape-wrapped scintillator on a board of the same 5 x 5 footprint, with the
-OLED and the LED flush on the board's outer face.
+tape-wrapped scintillator on a board of the same 5 x 5 footprint.
 
 At 17 cm the face spans theta 41.6 to 58.4 and phi -10.9 to +10.9.  A square
 face always subtends MORE in phi than in theta -- the phi lever arm is
@@ -181,14 +181,10 @@ TRIG_THETA = 50.0            # accepted direction: theta at the centre
 TRIG_PHI = 0.0               # ... and phi
 TRIG_DIST = 17.0             # pivot to the centre of each pair
 TRIG_ADC_MAX = 1024.0        # Arduino analogRead full scale
-TRIG_LED_ON = 500.0          # LED lights above this
+TRIG_HOT = 500.0             # HUD stars a channel above this
 
 CW_TAPE = "#141414"          # electrical tape over the scintillator
 CW_PCB = "#1d6b46"           # the CosmicWatch board
-CW_OLED = "#2b4f8f"          # the OLED breakout
-CW_SILVER = "#c8ccd2"
-CW_LED_OFF = "#9fb0b8"
-CW_LED_ON = "#ff4d3a"
 
 RING_HI, RING_LO = 15, 5     # the eleven rings that are read out
 NRING_DATA = RING_HI - RING_LO + 1
@@ -212,7 +208,38 @@ BRASS_LIT = "#ffd27f"          # the phi needle on the bearing ring
 GUNMETAL = "#2b3138"
 MUON = "#31e8ff"
 HUD = "#8fe8f2"
+# Point sizes for the text in the 3-D viewport, at a 950-pixel-tall window.
+# Kept small so the block in the top corner stays clear of the detector; both
+# are scaled by the window height at draw time.
+HUD_BASE = 5.9
+FOOT_BASE = 4.6
 DEAD = "#243039"              # a SiPM with no light
+
+# VTK's built-in courier/arial have no Greek glyphs -- theta and phi come out
+# as blanks -- so the HUD is drawn with matplotlib's DejaVu Sans Mono, which
+# has them and keeps the columns lined up.
+def _hud_font():
+    try:
+        import matplotlib
+        path = os.path.join(matplotlib.get_data_path(), "fonts", "ttf",
+                            "DejaVuSansMono.ttf")
+        if os.path.exists(path):
+            return {"font_file": path}
+    except Exception:
+        pass
+    return {"font": "courier"}
+
+
+HUD_FONT = None                               # filled in on first use
+THETA, PHI = "\u03b8", "\u03c6"
+
+
+def hud_font():
+    global HUD_FONT
+    if HUD_FONT is None:
+        HUD_FONT = _hud_font()
+    return dict(HUD_FONT)
+
 
 # cyan through brass to pale gold: the two accent colours of the helmet, in a
 # ramp that still reads monotonically from dark to bright
@@ -526,42 +553,6 @@ def cosmicwatch_body(centre, w, outer=True):
     return parts
 
 
-def cosmicwatch_readout(centre, w, value, outer=True):
-    """The OLED and the LED, which are the only per-event parts."""
-    M = _cw_frame(centre, w, outer)
-    parts = []
-
-    def add(mesh, **style):
-        parts.append((mesh.transform(M, inplace=False), style))
-
-    add(pv.Cube(center=(0.5 * TRIG_THICK + 0.27, -0.75, -1.45),
-                x_length=0.12, y_length=2.4, z_length=1.5),
-        color=screen_colour(value), smooth_shading=False, ambient=0.95,
-        diffuse=0.25, specular=0.6, specular_power=60)
-    lit = value is not None and value > TRIG_LED_ON
-    add(pv.Cylinder(center=(0.5 * TRIG_THICK + 0.32, 1.55, -1.45),
-                    direction=(1, 0, 0), radius=0.26, height=0.5,
-                    resolution=18),
-        color=CW_LED_ON if lit else CW_LED_OFF, smooth_shading=True,
-        ambient=1.0 if lit else 0.30, diffuse=0.2 if lit else 0.8,
-        specular=1.0, specular_power=70, opacity=1.0 if lit else 0.65)
-    if lit:                                    # a soft bloom, as on the SiPMs
-        add(pv.Sphere(radius=0.62,
-                      center=(0.5 * TRIG_THICK + 0.42, 1.55, -1.45)),
-            color=CW_LED_ON, opacity=0.18, ambient=1.0, diffuse=0.0,
-            specular=0.0)
-    return parts
-
-
-def screen_colour(value):
-    """The OLED colour for an ADC value, on the same ramp as the SiPMs."""
-    if value is None:
-        return "#101418"
-    x = float(np.clip(value / TRIG_ADC_MAX, 0.0, 1.0))
-    r, g, b = GLOW(x)[:3]
-    return (float(r), float(g), float(b))
-
-
 def compass_meshes():
     """A brass bearing ring under the detector, with the four boards marked.
 
@@ -675,7 +666,7 @@ def light_azimuth(counts):
 # the 3-D scene in the middle, the radiograph on the right.  The panels are
 # drawn as that viewport's background image, which is what keeps them square
 # to the screen and fixed while the detector is rotated, zoomed or panned.
-PANEL_WEIGHTS = (1.0, 2.1, 1.0)
+PANEL_WEIGHTS = (1.0, 2.1, 1.5)
 PANEL_DPI = 100.0
 
 # the trigger acceptance drawn as the shaded wedge on the radiograph
@@ -697,12 +688,25 @@ def _panel_figure(figsize, dpi=100):
     return fig
 
 
-def _style_axes(ax, colour=HUD):
+PANEL_FS_REF = 3.6           # panel width, in inches, the base sizes suit
+
+
+def _fs(figsize, base):
+    """Font size for a panel of this width.
+
+    The panels are built at their viewport's pixel size, so point sizes are
+    pixel sizes: text has to shrink with a dragged-in window or it clips, and
+    grow with a big one or it is unreadable.  Clamped at both ends."""
+    return float(np.clip(base * figsize[0] / PANEL_FS_REF, 5.0,
+                         base * 2.6))
+
+
+def _style_axes(ax, colour=HUD, fs=8.0):
     ax.set_facecolor("none")
     for sp in ax.spines.values():
         sp.set_color(colour)
         sp.set_linewidth(0.8)
-    ax.tick_params(colors=colour, labelsize=8, length=3, width=0.8)
+    ax.tick_params(colors=colour, labelsize=fs, length=3, width=0.8)
     ax.yaxis.label.set_color(colour)
     ax.xaxis.label.set_color(colour)
     ax.title.set_color(colour)
@@ -719,18 +723,18 @@ def panel_grid_figure(counts, cmap, figsize, title=None, vmax=None):
     top = float(vmax) if vmax else max(1.0, float(img.max()))
     fig = _panel_figure(figsize)
     ax = fig.add_axes([0.17, 0.045, 0.60, 0.845])
-    _style_axes(ax)
+    _style_axes(ax, fs=_fs(figsize, 8))
     norm = Normalize(0.0, top)
     ax.imshow(img, cmap=cmap, norm=norm, aspect="auto", origin="upper",
               interpolation="nearest")
 
     ax.set_xticks(range(len(COLS)))
-    ax.set_xticklabels(COLS, fontsize=11)
+    ax.set_xticklabels(COLS, fontsize=_fs(figsize, 11))
     ax.xaxis.set_ticks_position("top")
     ax.set_yticks(range(NRING_DATA))
     ax.set_yticklabels([str(RING_HI - k) for k in range(NRING_DATA)],
-                       fontsize=8)
-    ax.set_ylabel("detector ring", fontsize=9)
+                       fontsize=_fs(figsize, 8))
+    ax.set_ylabel("detector ring", fontsize=_fs(figsize, 9))
     ax.set_xticks(np.arange(-0.5, len(COLS), 1), minor=True)
     ax.set_yticks(np.arange(-0.5, NRING_DATA, 1), minor=True)
     ax.grid(which="minor", color=BG_HIGH, linewidth=0.8)
@@ -743,7 +747,8 @@ def panel_grid_figure(counts, cmap, figsize, title=None, vmax=None):
             rgb = sm.to_rgba(v)[:3]
             lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
             ax.text(c, r, "%d" % round(v), ha="center", va="center",
-                    fontsize=7.5, color="#101010" if lum > 0.6 else "#e8f4f8")
+                    fontsize=_fs(figsize, 7.5),
+                    color="#101010" if lum > 0.6 else "#e8f4f8")
     if img.max() > 0:                            # nothing to point at when empty
         hot = np.unravel_index(int(np.argmax(img)), img.shape)
         ax.add_patch(Rectangle((hot[1] - 0.5, hot[0] - 0.5), 1, 1, fill=False,
@@ -751,12 +756,12 @@ def panel_grid_figure(counts, cmap, figsize, title=None, vmax=None):
 
     cax = fig.add_axes([0.81, 0.045, 0.045, 0.845])
     cb = fig.colorbar(sm, cax=cax)
-    cb.set_label("photons", color=HUD, fontsize=9)
-    cb.ax.tick_params(colors=HUD, labelsize=7.5)
+    cb.set_label("photons", color=HUD, fontsize=_fs(figsize, 9))
+    cb.ax.tick_params(colors=HUD, labelsize=_fs(figsize, 7.5))
     cb.outline.set_edgecolor(HUD)
     if title:
         fig.text(0.5, 0.965, title, ha="center", va="top", color=HUD,
-                 fontsize=9, family="monospace")
+                 fontsize=_fs(figsize, 9), family="monospace")
     return fig
 
 
@@ -768,17 +773,18 @@ def panel_radiograph_figure(theta=None, phi=None, figsize=(4.5, 4.5)):
     """
     fig = _panel_figure(figsize)
     w, h = fig.get_size_inches()
-    side = min(0.84, 0.84 * w / h)               # keep the dial round
+    side = min(0.78, 0.78 * w / h)               # keep the dial round
     ax = fig.add_axes([0.5 - side * h / w / 2.0, 0.5 - side / 2.0,
                        side * h / w, side], projection="polar")
     ax.set_facecolor("none")
     ax.set_ylim(0, 80)
     ax.set_rgrids(range(10, 80, 10),
                   labels=["%d" % v for v in range(10, 80, 10)],
-                  color="#e8f4f8", fontsize=7.5, angle=112.5)
+                  color="#e8f4f8", fontsize=_fs(figsize, 7.5),
+                  angle=112.5)
     ax.set_thetagrids(range(0, 360, 45),
                       labels=["%d°" % v for v in range(0, 360, 45)],
-                      color=HUD, fontsize=8)
+                      color=HUD, fontsize=_fs(figsize, 8))
     ax.grid(color="#2c4356", linewidth=0.7)
     ax.spines["polar"].set_color(HUD)
 
@@ -791,14 +797,16 @@ def panel_radiograph_figure(theta=None, phi=None, figsize=(4.5, 4.5)):
                 color=EVENT_DOT, markersize=7,
                 markeredgecolor="#ffd0c4", markeredgewidth=0.8, zorder=5)
 
-    fig.text(0.5, 0.5 + side / 2.0 + 0.055, "theta vs phi radiograph",
-             ha="center", va="bottom", color=HUD, fontsize=9,
-             family="monospace")
-    fig.text(0.5, 0.5 + side / 2.0 + 0.028,
-             "trigger: %g-%g deg theta, %+g to %+g deg phi"
-             % (BAND_THETA[0], BAND_THETA[1], BAND_PHI[0], BAND_PHI[1]),
-             ha="center", va="bottom", color="#5d7d8a", fontsize=7.5,
-             family="monospace")
+    fig.text(0.5, 0.5 + side / 2.0 + 0.082,
+             u"%s vs %s radiograph" % (THETA, PHI),
+             ha="center", va="bottom", color=HUD,
+             fontsize=_fs(figsize, 9), family="monospace")
+    fig.text(0.5, 0.5 + side / 2.0 + 0.050,
+             u"trigger: %g-%g\u00b0 %s,  %+g to %+g\u00b0 %s"
+             % (BAND_THETA[0], BAND_THETA[1], THETA,
+                BAND_PHI[0], BAND_PHI[1], PHI),
+             ha="center", va="bottom", color="#5d7d8a",
+             fontsize=_fs(figsize, 7.5), family="monospace")
     return fig
 
 
@@ -807,7 +815,7 @@ def setup_text(nev, trig_dist, track_z0, triggers=True):
     lines = ["DETECTOR SETUP",
              "",
              "scint    cylinder %.1f cm dia x %.0f cm" % (2 * R_CYL, H_CYL),
-             "boards   %s at %s deg"
+             u"boards   %s at %s\u00b0"
              % ("/".join(COLS), "/".join("%.0f" % COL_PHI[c] for c in COLS)),
              "SiPMs    %d per board, %.2f cm pitch" % (N_RING, SIPM_PITCH),
              "         rings %d-%d read out (%d)"
@@ -818,12 +826,12 @@ def setup_text(nev, trig_dist, track_z0, triggers=True):
         dp = np.degrees(np.arctan(TRIG_SIZE / 2.0 / rho))
         lines += ["trigger  %d CosmicWatch, %g x %g x %g cm"
                   % (N_TRIG, TRIG_SIZE, TRIG_SIZE, TRIG_THICK),
-                  "         %.1f cm from (0,0,%g) on theta %g phi %g"
-                  % (trig_dist, track_z0, TRIG_THETA, TRIG_PHI),
-                  "         theta %.1f-%.1f, phi %+.1f to %+.1f"
-                  % (TRIG_THETA - dt, TRIG_THETA + dt, -dp, dp)]
-    lines += ["", "%d event%s loaded" % (nev, "" if nev == 1 else "s"),
-              "press Right to show the first"]
+                  u"         %.1f cm from (0,0,%g) on %s %g\u00b0 %s %g\u00b0"
+                  % (trig_dist, track_z0, THETA, TRIG_THETA, PHI, TRIG_PHI),
+                  u"         %s %.1f-%.1f\u00b0, %s %+.1f to %+.1f\u00b0"
+                  % (THETA, TRIG_THETA - dt, TRIG_THETA + dt, PHI, -dp, dp)]
+    lines += ["%d event%s loaded -- press Right for the first"
+              % (nev, "" if nev == 1 else "s")]
     return "\n".join(lines)
 
 
@@ -831,23 +839,23 @@ def hud_text(ev, counts, phi_sense="to"):
     tot = int(counts.sum())
     hot = np.unravel_index(int(np.argmax(counts)), counts.shape)
     bt = counts.sum(axis=1)
-    return ("TrgID %d\n"
-            "theta    %7.2f deg\n"
-            "phi      %7.2f deg   (muon %s)\n"
-            "conf     %7.3f\n"
-            "photons  %7d\n"
-            "hottest  %s ring %d  (%d)\n"
-            "boards   %s\n"
-            "light at %7.2f deg%s"
-            % (ev["trgid"], ev["theta"], ev["phi"],
-               "arrives from phi" if phi_sense == "from" else "travels to phi",
+    return (u"TrgID %d\n"
+            u"%s           %7.2f\u00b0\n"
+            u"%s           %7.2f\u00b0   (muon %s %s)\n"
+            u"confidence  %7.3f\n"
+            u"photons     %7d\n"
+            u"hottest     %s ring %d  (%d)\n"
+            u"boards      %s\n"
+            u"light at    %7.2f\u00b0%s"
+            % (ev["trgid"], THETA, ev["theta"], PHI, ev["phi"],
+               "arrives from" if phi_sense == "from" else "travels to", PHI,
                ev["conf"], tot,
                COLS[hot[0]], RING_HI - hot[1], int(counts[hot]),
                "  ".join("%s %d" % (c, bt[i]) for i, c in enumerate(COLS)),
                light_azimuth(counts),
                "" if ev.get("trig") is None else
                "\ntrigger  " + "  ".join(
-                   "%d%s" % (v, "*" if v > TRIG_LED_ON else "")
+                   "%d%s" % (v, "*" if v > TRIG_HOT else "")
                    for v in ev["trig"].astype(int))))
 
 
@@ -873,7 +881,8 @@ class Display:
         self.panels = panels
         self.window_size = tuple(window_size)
         self._tmp = tempfile.mkdtemp(prefix="evd3d_")
-        self._bg = {}                            # background renderer per side
+        self._panel_actor = {}                   # textured plane per side
+        self._panel_size = {}
         self._saved = 0
         self._last_ws = tuple(window_size)
         self.savedir = savedir
@@ -894,7 +903,8 @@ class Display:
             for mesh, style in compass_meshes()[0]:
                 self.pl.add_mesh(mesh, reset_camera=False, **style)
             pos, txt = compass_labels()
-            self.pl.add_point_labels(pos, txt, font_size=13,
+            self.pl.add_point_labels(pos, txt,
+                                     font_size=self.hud_size(11),
                                      text_color=BRASS, shape=None,
                                      show_points=False, always_visible=True)
         light_rig(self.pl)
@@ -927,9 +937,9 @@ class Display:
         tri, tpos, ttxt = axes_triad_meshes()
         for mesh, style in tri:
             self.pl.add_mesh(mesh, reset_camera=False, **style)
-        self.pl.add_point_labels(tpos, ttxt, font_size=13, text_color=HUD,
-                                 shape=None, show_points=False,
-                                 always_visible=True)
+        self.pl.add_point_labels(tpos, ttxt, font_size=self.hud_size(11),
+                                 text_color=HUD, shape=None,
+                                 show_points=False, always_visible=True)
         for key in ("Right", "n"):
             self.pl.add_key_event(key, self.next)
         for key in ("Left", "p"):
@@ -961,6 +971,35 @@ class Display:
         self.draw()
 
     # -- viewports ---------------------------------------------------------
+    def add_hud(self, text, position, base, colour, shadow=False):
+        """A HUD text actor, with a little leading -- DejaVu Sans Mono sets
+        its lines tighter than VTK's courier did and they touch otherwise.
+
+        render=False matters: add_text() would otherwise draw the block at the
+        default line spacing, and the next render would redraw it at 1.28 and
+        the whole block would visibly jump.  Nothing is painted until draw()
+        renders once at the end.
+        """
+        actor = self.pl.add_text(text, position=position,
+                                 font_size=self.hud_size(base), color=colour,
+                                 shadow=shadow, render=False, **hud_font())
+        try:
+            actor.GetTextProperty().SetLineSpacing(1.28)
+        except Exception:
+            pass
+        return actor
+
+    def hud_size(self, base):
+        """VTK text is sized in points, so it has to be scaled by hand or it
+        shrinks away on a big window."""
+        try:
+            h = self.pl.window_size[1]
+        except Exception:
+            h = self.window_size[1]
+        return int(round(float(np.clip(base * h / 950.0,
+                                       max(7.0, base * 0.7),
+                                       max(8.0, base * 2.6)))))
+
     def mid(self):
         """Make the 3-D viewport active.  Every camera, light, actor and text
         call below acts on whichever renderer is current, so this has to be
@@ -983,38 +1022,74 @@ class Display:
         return (px[0] / PANEL_DPI, px[1] / PANEL_DPI)
 
     def show_panel(self, col, fig):
-        """Draw a panel figure into its viewport's background.
+        """Draw a panel figure onto a textured plane filling its viewport.
 
-        pyvista's remove_background_image() clears the renderer's actors but
-        leaves the renderer attached to the render window, so add/remove per
-        event stacks one panel on top of the last -- which is what doubled up
-        the tick labels and the frame.  The background renderer is therefore
-        created once and its image swapped in place afterwards.
+        Not pyvista's background-image machinery: that puts the panel on a
+        renderer of its own which does not clear its viewport, so anything the
+        previous frame left outside the new image stayed on screen -- the
+        ghosting after a resize.  An ordinary actor in the viewport's own
+        renderer is erased and redrawn every frame like everything else.
         """
         path = os.path.join(self._tmp, "panel%d.png" % col)
-        fig.savefig(path, dpi=PANEL_DPI, facecolor=BG_LOW,
-                    transparent=False)
-        bg = self._bg.get(col)
-        if bg is None:
-            self.pl.subplot(0, col)
-            self.pl.add_background_image(path, as_global=False)
-            idx = self.pl.renderers.active_index
-            self._bg[col] = self.pl.renderers._background_renderers[idx]
+        fig.savefig(path, dpi=PANEL_DPI, facecolor=BG_LOW, transparent=False)
+        tex = pv.read_texture(path)
+        w, h = tex.dimensions[:2] if hasattr(tex, "dimensions") else (1, 1)
+        try:
+            w, h = tex.to_image().dimensions[:2]
+        except Exception:
+            pass
+
+        self.pl.subplot(0, col)
+        actor = self._panel_actor.get(col)
+        if actor is None:
+            plane = pv.Plane(center=(0, 0, 0), direction=(0, 0, 1),
+                             i_size=float(w), j_size=float(h),
+                             i_resolution=1, j_resolution=1)
+            actor = self.pl.add_mesh(plane, texture=tex, lighting=False,
+                                     ambient=1.0, diffuse=0.0, specular=0.0,
+                                     show_scalar_bar=False, reset_camera=False)
+            self._panel_actor[col] = actor
+            self._panel_size[col] = (float(w), float(h))
+            # the panel must not respond to the mouse at all
+            try:
+                self.pl.renderer.InteractiveOff()
+            except Exception:
+                pass
         else:
             try:
-                img = pv.read(path, cls=pv.ImageData)
-                bg._actors["background"].SetInputData(img)
-                bg.resize()
-            except Exception:                    # fall back to a rebuild
-                self.pl.subplot(0, col)
-                try:
-                    self.pl.remove_background_image()
-                except Exception:
-                    pass
-                self.pl.add_background_image(path, as_global=False)
-                idx = self.pl.renderers.active_index
-                self._bg[col] = self.pl.renderers._background_renderers[idx]
+                actor.SetTexture(tex)
+            except Exception:
+                actor.texture = tex
+            if self._panel_size.get(col) != (float(w), float(h)):
+                self.pl.remove_actor(actor, render=False)
+                del self._panel_actor[col]
+                self.mid()
+                return self.show_panel(col, fig)
+        self.fit_panel(col)
         self.mid()
+
+    def fit_panel(self, col):
+        """Parallel camera square to the plane, scaled so it fills the
+        viewport exactly -- the figure is already made at the viewport's
+        aspect, so this is a straight 1:1 fit."""
+        size = self._panel_size.get(col)
+        if size is None:
+            return
+        w, h = size
+        self.pl.subplot(0, col)
+        cam = self.pl.camera
+        cam.enable_parallel_projection()
+        cam.SetFocalPoint(0.0, 0.0, 0.0)
+        cam.SetPosition(0.0, 0.0, max(w, h) * 2.0)
+        cam.SetViewUp(0.0, 1.0, 0.0)
+        try:
+            vx0, vy0, vx1, vy1 = self.pl.renderer.viewport
+            ww, hh = self.pl.window_size
+            aspect = max(1e-6, (vx1 - vx0) * ww / max(1e-6, (vy1 - vy0) * hh))
+        except Exception:
+            aspect = w / h
+        cam.parallel_scale = max(h / 2.0, (w / 2.0) / aspect)
+        self.pl.reset_camera_clipping_range()
 
     def trig_placements(self):
         return trig_placements(self.phi_sense, self.track_z0, self.trig_dist)
@@ -1070,8 +1145,9 @@ class Display:
             return
         if counts is None:
             counts = np.zeros((len(COLS), NRING_DATA))
-        title = ("TrgID %d   theta %.1f   phi %.1f   conf %.3f"
-                 % (ev["trgid"], ev["theta"], ev["phi"], ev["conf"])
+        title = (u"TrgID %d   %s %.1f   %s %.1f   confidence %.3f"
+                 % (ev["trgid"], THETA, ev["theta"], PHI, ev["phi"],
+                    ev["conf"])
                  if ev else "no event loaded")
         self.show_panel(0, panel_grid_figure(counts, self.cmap,
                                              self.panel_figsize("left"),
@@ -1088,8 +1164,9 @@ class Display:
             return
         if counts is None:
             counts = np.zeros((len(COLS), NRING_DATA))
-        title = ("TrgID %d   theta %.1f   phi %.1f   conf %.3f"
-                 % (ev["trgid"], ev["theta"], ev["phi"], ev["conf"])
+        title = (u"TrgID %d   %s %.1f   %s %.1f   confidence %.3f"
+                 % (ev["trgid"], THETA, ev["theta"], PHI, ev["phi"],
+                    ev["conf"])
                  if ev else "no event loaded")
         self.show_panel(0, panel_grid_figure(counts, self.cmap,
                                              self.panel_figsize("left"),
@@ -1118,6 +1195,14 @@ class Display:
 
         self.draw_panels(ev, counts, vmax if self.zmax else None)
 
+        # pyvista reuses a scalar bar that already carries this title and
+        # keeps its old range, so the bar has to go before the tiles are
+        # re-added or it shows the previous event's scale
+        try:
+            self.pl.remove_scalar_bar("photons", render=False)
+        except Exception:
+            pass
+
         tiles = build_sipms(counts)
         self.dynamic.append(self.pl.add_mesh(
             tiles, scalars="photons", cmap=self.cmap, clim=clim,
@@ -1128,7 +1213,8 @@ class Display:
             scalar_bar_args=dict(title="photons", color=HUD, n_labels=6,
                                  vertical=True, width=0.035, height=0.42,
                                  position_x=0.875, position_y=0.30,
-                                 title_font_size=15, label_font_size=12,
+                                 title_font_size=self.hud_size(12),
+                                 label_font_size=self.hud_size(10),
                                  fmt="%.0f")))
 
         if self.halo:
@@ -1139,15 +1225,6 @@ class Display:
                     reset_camera=False,
                     opacity=0.22, show_scalar_bar=False, ambient=1.0,
                     diffuse=0.0, specular=0.0))
-
-        if self.triggers:
-            vals = ev.get("trig")
-            for k, (c, w, outer) in enumerate(self.trig_placements()):
-                v = None if vals is None else float(vals[k])
-                for mesh, style in cosmicwatch_readout(c, w, v, outer):
-                    self.dynamic.append(self.pl.add_mesh(
-                        mesh, reset_camera=False, show_scalar_bar=False,
-                        **style))
 
         if self.compass:
             shaft, tip, _, _ = phi_pointer(ev["phi"])
@@ -1174,15 +1251,13 @@ class Display:
             reset_camera=False,
             show_scalar_bar=False))
 
-        self.dynamic.append(self.pl.add_text(
-            hud_text(ev, counts, self.phi_sense),
-            position="upper_left", font_size=11,
-            color=HUD, font="courier", shadow=True))
+        self.dynamic.append(self.add_hud(
+            hud_text(ev, counts, self.phi_sense), "upper_left", HUD_BASE,
+            HUD, shadow=True))
         foot = "[%d/%d]  %s   (Right = next, Left = previous)" \
             % (self.i + 1, len(self.events), ev["name"])
-        self.dynamic.append(self.pl.add_text(
-            foot, position="lower_left", font_size=8, color="#5d7d8a",
-            font="courier"))
+        self.dynamic.append(self.add_hud(foot, "lower_left", FOOT_BASE,
+                                         "#5d7d8a"))
         self.pl.render()
 
     def draw_setup(self):
@@ -1194,22 +1269,14 @@ class Display:
             dark, color=DEAD, reset_camera=False, smooth_shading=True,
             specular=0.3, ambient=0.25, show_scalar_bar=False))
 
-        if self.triggers:
-            for c, w, outer in self.trig_placements():
-                for mesh, style in cosmicwatch_readout(c, w, None, outer):
-                    self.dynamic.append(self.pl.add_mesh(
-                        mesh, reset_camera=False, show_scalar_bar=False,
-                        **style))
 
-        self.dynamic.append(self.pl.add_text(
+        self.dynamic.append(self.add_hud(
             setup_text(len(self.events), self.trig_dist, self.track_z0,
-                       self.triggers),
-            position="upper_left", font_size=11, color=HUD,
-            font="courier", shadow=True))
-        self.dynamic.append(self.pl.add_text(
+                       self.triggers), "upper_left", HUD_BASE - 1, HUD,
+            shadow=True))
+        self.dynamic.append(self.add_hud(
             "[setup]   no event loaded   (Right = first event)",
-            position="lower_left", font_size=8, color="#5d7d8a",
-            font="courier"))
+            "lower_left", FOOT_BASE, "#5d7d8a"))
         self.pl.render()
 
     # -- outputs -----------------------------------------------------------
@@ -1343,7 +1410,7 @@ def main(argv=None):
     p.add_argument("--no-compass", action="store_true",
                    help="hide the brass bearing ring, its A/B/C/D board tags "
                         "and the gold phi needle")
-    p.add_argument("--size", type=int, nargs=2, default=[1800, 950],
+    p.add_argument("--size", type=int, nargs=2, default=[3800, 2000],
                    metavar=("W", "H"), help="window / image size")
     args = p.parse_args(argv)
 
