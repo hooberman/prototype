@@ -30,7 +30,37 @@ Output
                                                 with the photon-peak fit and a
                                                 data/fit ratio panel under it
                                                 (--no-ratio drops the panel)
-    RunX_photonPeaks_fit.txt                    the fit report as plain text
+    RunX_photonPeaks_fit.txt                    the pooled fit report
+    RunX_photonPeaks_gainMap.png/.pdf           16 x 4 map of M, one cell per
+                                                SiPM
+    RunX_photonPeaks_perSiPM.txt                M, its error, P and chi2/ndf
+                                                for every SiPM
+
+Per-SiPM fits
+-------------
+The same model is fitted to every SiPM channel on its own, not just to the
+pooled spectrum.  Each channel's fit is drawn over its histogram in the 4 x 4
+grids, in that column's colour, with its M in the legend, and the results go
+into a 16 x 4 map on the channel -> cell rule convertDataFile.py uses:
+
+    ch 6..31   even -> A(3 + (ch-6)//2),  odd -> C(...)
+    ch 32..63  even -> B((ch-32)//2),     odd -> D(...)
+
+so A0-A2 and C0-C2 have no channel behind them and are drawn grey, and a
+channel whose fit did not converge is hatched rather than left the same grey.
+The map's colour scale is diverging about the MEDIAN M, because the question a
+gain map answers is which channels sit away from the pack.
+
+Every channel is seeded at the pooled M from the all-50 fit, which is both
+faster -- the seed scan is skipped -- and much safer: one channel has ~1/50 of
+the pooled statistics, and an unseeded comb on thin statistics is exactly where
+M lands on a sub-multiple of the true spacing.  --per-sipm-no-seed scans each
+channel independently instead, --per-sipm-npeaks uses fewer peaks per channel
+than the pooled fit, and --no-per-sipm skips all of it.
+
+    NOTE  ch2-5 are A1, C1, A2, C2 in the Sept 9 map below, but TrigA, TrigC,
+    TrigB, TrigD on the Sept 14 sheet.  They are excluded from the fits under
+    either reading, so no fitted number depends on which is right.
 
 The fit
 -------
@@ -123,6 +153,7 @@ import argparse
 import os
 import re
 import sys
+import time
 
 import numpy as np
 import matplotlib
@@ -361,8 +392,14 @@ def read_hg(path, skip_events=1, max_events=None, column="HG"):
 # ----------------------------------------------------------------------------
 def make_plot(vals, out_paths, title, subtitle, lo, hi, nbins,
               logy=False, density=False, column="HG", cols=None,
-              per_panel_y=False):
-    """One 4x4 grid.  cols selects which detector columns to overlay."""
+              per_panel_y=False, fits=None):
+    """One 4x4 grid.  cols selects which detector columns to overlay.
+
+    With `fits` -- {ch: fit dict} from fit_per_sipm -- each channel's own
+    fitted comb is drawn over its histogram in the same colour, and its M goes
+    in the legend.  The fit is not drawn on a density plot: it was fitted to
+    counts, so it would sit at the wrong scale.
+    """
     cols = list(COLS) if cols is None else list(cols)
     edges = np.linspace(lo, hi, nbins + 1)
     centres = 0.5 * (edges[:-1] + edges[1:])
@@ -387,10 +424,22 @@ def make_plot(vals, out_paths, title, subtitle, lo, hi, nbins,
             if x.size == 0:
                 continue
             h, _ = np.histogram(x, bins=edges, density=density)
+            fit = (fits or {}).get(ch)
+            ok = bool(fit and fit.get("ok")) and not density
+            lab = "%s%d  (ch%02d)" % (col, row, ch)
+            if fits is not None:
+                lab += ("  M=%.1f" % fit["gain"] if ok
+                        else "  no fit" if fit else "")
             ax.step(centres, h, where="mid", color=COLCOLOUR[col],
-                    lw=LINEWIDTH, solid_joinstyle="miter",
-                    label="%s%d  (ch%02d)" % (col, row, ch))
+                    lw=LINEWIDTH, solid_joinstyle="miter", label=lab)
             pmax = max(pmax, float(h.max()) if h.size else 0.0)
+            if ok:
+                xf = np.linspace(fit["fit_lo"], fit["fit_hi"], 400)
+                yf = peak_model(xf, fit["p"], fit["npeaks"], fit["ped"],
+                                fit.get("i0", 1))
+                ax.plot(xf, yf, color=COLCOLOUR[col], lw=1.3, alpha=0.9,
+                        zorder=5)
+                pmax = max(pmax, float(np.max(yf)))
             nplotted += 1
         ymax = max(ymax, pmax)
         panel_max[k] = pmax
@@ -589,6 +638,7 @@ def spread_seeds(scan, nseeds, n_lo, n_hi):
 def fit_photon_peaks(centres, y, yerr, npeaks=NPEAKS, sigma_init=SIGMA_INIT,
                      sigma_lo=SIGMA_LO, sigma_hi=SIGMA_HI,
                      n_init=None, n_lo=None, n_hi=None, nseeds=5,
+                     nscan=NSCAN,
                      bkg_mode=BKG_FALLING, sig_frac_lo=SIG_FRAC_LO,
                      sig_frac_hi=SIG_FRAC_HI, i0=1,
                      ped_init=None, ped_lo=None, ped_hi=None, fix_ped=None):
@@ -656,9 +706,15 @@ def fit_photon_peaks(centres, y, yerr, npeaks=NPEAKS, sigma_init=SIGMA_INIT,
     nbkg = 0 if bkg_mode == BKG_NONE else 3
     nonneg_lin = bkg_mode in (BKG_FALLING, BKG_NONNEG, BKG_NONE)
 
-    scan = seed_gain(x, y, w, npeaks, sigma_init, sigma_lo, sigma_hi,
-                     n_lo, n_hi, mode=bkg_mode, a=xa, b=xb,
-                     ped=ped_fixed, i0=i0)
+    # the scan is the expensive part.  With a seed already in hand -- the
+    # per-SiPM fits are seeded from the pooled M -- there is nothing for it to
+    # decide, so nscan=0 skips it.
+    if n_init is not None and nscan <= 0:
+        scan = []
+    else:
+        scan = seed_gain(x, y, w, npeaks, sigma_init, sigma_lo, sigma_hi,
+                         n_lo, n_hi, nscan=max(int(nscan), 1), mode=bkg_mode,
+                         a=xa, b=xb, ped=ped_fixed, i0=i0)
     if n_init is not None:
         dm = _design(x, float(n_init), [sigma_init] * npeaks, npeaks,
                      bkg_mode, xa, xb, ped_fixed, i0)
@@ -797,7 +853,7 @@ def fit_photon_peaks(centres, y, yerr, npeaks=NPEAKS, sigma_init=SIGMA_INIT,
             "sig_err": perr[4 + npeaks:4 + 2 * npeaks],
             "n_lo": float(n_lo), "n_hi": float(n_hi),
             "scan": [(c, g) for c, g, _s, _k
-                     in spread_seeds(scan, 6, n_lo, n_hi)],
+                     in spread_seeds(scan, 6, n_lo, n_hi)] if scan else [],
             "sigma_lo": float(sigma_lo), "sigma_hi": float(sigma_hi),
             "sigma_init": float(sigma_init),
             "n_seed": float(n_init) if n_init is not None else None,
@@ -1325,6 +1381,234 @@ def make_all50(vals, out_paths, title, subtitle, lo, hi, nbins,
 
 
 # ----------------------------------------------------------------------------
+# per-SiPM fits, and the 16 x 4 map of M
+#
+# The channel -> cell rule is the one convertDataFile.py uses (Sept 14):
+# ch6-31 even = A(3 + (ch-6)//2), odd = C(...);  ch32-63 even = B((ch-32)//2),
+# odd = D(...).  That is the same rule this script's own CHMAP uses for ch6-63,
+# so every SiPM lands in the same place either way.  The one disagreement is
+# ch2-5: CHMAP above calls them A1, C1, A2, C2 and marks them UNCONNECTED,
+# while the Sept 14 sheet calls them TrigA, TrigC, TrigB, TrigD.  Neither is
+# fitted, so no number moves -- but A0-A2 and C0-C2 are all empty cells in the
+# map, exactly as in the average-photon map.
+# ----------------------------------------------------------------------------
+NRING_ALL = 16
+RING_ALL_HI = NRING_ALL - 1
+SEPT14_TRIG = {0: "TrigE", 1: "TrigF", 2: "TrigA", 3: "TrigC", 4: "TrigB",
+               5: "TrigD"}
+
+
+def sipm_cell(ch):
+    """ch -> (column letter, ring) under the Sept 14 assignment, or None."""
+    if 6 <= ch < 32:
+        return ("A" if ch % 2 == 0 else "C", 3 + (ch - 6) // 2)
+    if 32 <= ch < NCH:
+        return ("B" if ch % 2 == 0 else "D", (ch - 32) // 2)
+    return None
+
+
+SIPM_CH = [ch for ch in range(NCH) if sipm_cell(ch) is not None]
+
+
+def fit_one_channel(x, edges, centres, fit_lo, fit_hi, **kw):
+    """Fit one channel's own spectrum.  Same model as the pooled fit."""
+    if x.size == 0:
+        return {"ok": False, "why": "no entries"}
+    h, _ = np.histogram(x, bins=edges)
+    err = np.sqrt(np.maximum(h, 1.0))
+    sel = (centres >= fit_lo) & (centres <= fit_hi)
+    npar = 2 * kw.get("npeaks", NPEAKS) + 6
+    if sel.sum() < npar:
+        return {"ok": False, "why": "only %d bins in the fit range"
+                                    % int(sel.sum())}
+    if h[sel].sum() < 20:
+        return {"ok": False, "why": "only %d entries in the fit range"
+                                    % int(h[sel].sum())}
+    fit = fit_photon_peaks(centres[sel], h[sel].astype(float), err[sel], **kw)
+    if fit.get("ok"):
+        fit["fit_lo"], fit["fit_hi"] = float(fit_lo), float(fit_hi)
+        fit["nentries"] = int(h[sel].sum())
+    return fit
+
+
+def fit_per_sipm(vals, lo, hi, nbins, fit_lo, fit_hi, seed_gain_value=None,
+                 verbose=True, **kw):
+    """Fit every SiPM channel separately.  Returns {ch: fit dict}.
+
+    Seeding: with a pooled M in hand every channel starts from it, which is
+    both far faster (no scan) and far safer -- a single channel has ~1/50 of
+    the pooled statistics, and an unseeded comb on thin statistics is exactly
+    where M lands on a sub-multiple.
+    """
+    edges = np.linspace(lo, hi, nbins + 1)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    if seed_gain_value is not None:
+        kw = dict(kw, n_init=float(seed_gain_value), nscan=0)
+
+    fits = {}
+    nok = 0
+    for ch in SIPM_CH:
+        fits[ch] = fit_one_channel(vals[ch], edges, centres, fit_lo, fit_hi,
+                                   **kw)
+        if fits[ch].get("ok"):
+            nok += 1
+    if verbose:
+        print("per-SiPM   %d of %d channels fitted%s"
+              % (nok, len(SIPM_CH),
+                 "" if seed_gain_value is None
+                 else "  (seeded at the pooled M = %.2f)" % seed_gain_value))
+    return fits
+
+
+def gain_grid(fits):
+    """{ch: fit} -> two (16, 4) arrays of M and its error.
+
+    Cells with no channel behind them, and channels whose fit failed, come
+    back as nan; the two are told apart by HAS_CH below.
+    """
+    m = np.full((NRING_ALL, len(COLS)), np.nan)
+    e = np.full((NRING_ALL, len(COLS)), np.nan)
+    for ch, fit in fits.items():
+        cell = sipm_cell(ch)
+        if cell is None or not fit.get("ok"):
+            continue
+        col, ring = cell
+        if 0 <= ring < NRING_ALL:
+            m[RING_ALL_HI - ring][COLS.index(col)] = fit["gain"]
+            e[RING_ALL_HI - ring][COLS.index(col)] = fit["gain_err"]
+    return m, e
+
+
+HAS_CH = np.zeros((NRING_ALL, len(COLS)), dtype=bool)
+for _ch in SIPM_CH:
+    _col, _ring = sipm_cell(_ch)
+    if 0 <= _ring < NRING_ALL:
+        HAS_CH[RING_ALL_HI - _ring][COLS.index(_col)] = True
+
+
+def make_gain_map(fits, out_paths, title, subtitle, column="HG",
+                  pooled=None):
+    """The 16 x 4 map of M, one cell per SiPM.
+
+    Diverging scale centred on the MEDIAN M: on a gain map the question is
+    always which channels sit away from the pack, and a sequential ramp buries
+    that in the middle of the colour bar.
+    """
+    m, e = gain_grid(fits)
+    good = np.isfinite(m)
+    if not good.any():
+        print("  no gain map: no channel fitted successfully")
+        return []
+
+    med = float(np.median(m[good]))
+    dev = float(np.max(np.abs(m[good] - med)))
+    dev = max(dev, 1e-3)
+    cmap = plt.get_cmap("RdBu_r").copy()
+    cmap.set_bad("#d0d0d0")
+    norm = matplotlib.colors.Normalize(vmin=med - dev, vmax=med + dev)
+
+    fig = plt.figure(figsize=(7.6, 11.0))
+    gs = fig.add_gridspec(1, 2, width_ratios=[4.4, 0.2], wspace=0.06,
+                          left=0.115, right=0.855, top=0.812, bottom=0.05)
+    ax = fig.add_subplot(gs[0, 0])
+    ax_cb = fig.add_subplot(gs[0, 1])
+
+    im = ax.imshow(np.ma.masked_invalid(m), cmap=cmap, norm=norm,
+                   aspect="auto", extent=[0, len(COLS), 0, NRING_ALL],
+                   interpolation="nearest")
+    for r in range(NRING_ALL):
+        for c in range(len(COLS)):
+            y = NRING_ALL - r - 0.5
+            if not HAS_CH[r][c]:
+                ax.text(c + 0.5, y, "n/c", ha="center", va="center",
+                        fontsize=7.5, color="#707070")
+                continue
+            if not np.isfinite(m[r][c]):
+                # a channel that exists but whose fit did not converge: say so
+                # rather than leaving it the same grey as an empty position
+                ax.add_patch(plt.Rectangle((c, NRING_ALL - r - 1), 1, 1,
+                                           facecolor="#f2f2f2",
+                                           edgecolor="#cc3311", hatch="//",
+                                           lw=1.0, zorder=2))
+                ax.text(c + 0.5, y, "no fit", ha="center", va="center",
+                        fontsize=7.5, color="#cc3311", zorder=3)
+                continue
+            rgba = cmap(norm(m[r][c]))
+            lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+            ax.text(c + 0.5, y, "%.1f\n$\\pm$%.1f" % (m[r][c], e[r][c]),
+                    ha="center", va="center", fontsize=7.5,
+                    linespacing=1.15,
+                    color="black" if lum > 0.55 else "white")
+
+    ax.set_xticks([c + 0.5 for c in range(len(COLS))])
+    ax.set_xticklabels(COLS, fontsize=11)
+    ax.xaxis.tick_top()
+    ax.set_yticks([NRING_ALL - r - 0.5 for r in range(NRING_ALL)])
+    ax.set_yticklabels([str(RING_ALL_HI - r) for r in range(NRING_ALL)],
+                       fontsize=8)
+    ax.set_ylabel("detector ring", fontsize=10)
+    ax.set_xticks(range(len(COLS) + 1), minor=True)
+    ax.set_yticks(range(NRING_ALL + 1), minor=True)
+    ax.grid(which="minor", color="white", lw=0.8)
+    ax.tick_params(which="minor", length=0)
+    ax.tick_params(which="major", length=2)
+
+    cb = fig.colorbar(im, cax=ax_cb)
+    cb.set_label("M  [%s ADC counts per photoelectron]" % column, fontsize=9)
+    cb.ax.tick_params(labelsize=8)
+    cb.ax.axhline(med, color="0.1", lw=1.2)
+
+    fig.suptitle(title, fontsize=13, y=0.972)
+    lines = [subtitle,
+             "median M = %.2f,  spread %.2f to %.2f  (%d channels fitted)"
+             % (med, float(m[good].min()), float(m[good].max()),
+                int(good.sum()))]
+    if pooled is not None:
+        lines.append("pooled all-50 fit gave M = %.2f" % pooled)
+    lines.append("grey = no channel assigned (A0-A2, C0-C2);  "
+                 "hatched = channel present, fit did not converge")
+    fig.text(0.5, 0.932, "\n".join(lines), ha="center", va="top",
+             fontsize=8.5, color="0.25", linespacing=1.5)
+
+    for path in out_paths:
+        fig.savefig(path, dpi=DPI)
+    plt.close(fig)
+    return list(out_paths)
+
+
+def per_sipm_lines(fits, pooled=None):
+    """The per-channel table, as text."""
+    out = ["%-5s %-6s %-9s %10s %10s %10s %9s"
+           % ("ch", "cell", "status", "M", "err", "P", "chi2/ndf")]
+    ms = []
+    for ch in SIPM_CH:
+        col, ring = sipm_cell(ch)
+        fit = fits.get(ch) or {}
+        if not fit.get("ok"):
+            out.append("%-5d %-6s %-9s %10s %10s %10s %9s   %s"
+                       % (ch, "%s%d" % (col, ring), "FAILED", "-", "-", "-",
+                          "-", fit.get("why", "unknown")))
+            continue
+        ms.append(fit["gain"])
+        red = fit["chi2"] / fit["ndf"] if fit["ndf"] else float("nan")
+        out.append("%-5d %-6s %-9s %10.3f %10.3f %10.3f %9.2f"
+                   % (ch, "%s%d" % (col, ring), "ok", fit["gain"],
+                      fit["gain_err"], fit["ped"], red))
+    out.append("")
+    if ms:
+        a = np.asarray(ms)
+        out.append("fitted %d of %d SiPMs" % (a.size, len(SIPM_CH)))
+        out.append("M   mean %.3f   median %.3f   std %.3f   min %.3f   "
+                   "max %.3f" % (a.mean(), np.median(a), a.std(), a.min(),
+                                 a.max()))
+        if pooled is not None:
+            out.append("pooled all-50 fit: M = %.3f" % pooled)
+    else:
+        out.append("no channel was fitted successfully")
+    return out
+
+
+# ----------------------------------------------------------------------------
 def main(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -1436,6 +1720,21 @@ def main(argv=None):
     p.add_argument("--no-ratio", action="store_true",
                    help="do not add the data/fit ratio panel under the "
                         "all-50 spectrum")
+    p.add_argument("--no-per-sipm", action="store_true",
+                   help="do not fit the SiPMs individually.  By default every "
+                        "SiPM channel is fitted on its own as well as pooled, "
+                        "the per-channel fits are drawn on the 4x4 grids, and "
+                        "a 16x4 map of M is written as RunX_photonPeaks_"
+                        "gainMap.png/.pdf with the table in _perSiPM.txt")
+    p.add_argument("--per-sipm-npeaks", type=int, default=None, metavar="N",
+                   help="peaks in the per-channel fits (default: --npeaks).  A "
+                        "single channel has ~1/50 of the pooled statistics, so "
+                        "fewer peaks is often the steadier choice")
+    p.add_argument("--per-sipm-no-seed", action="store_true",
+                   help="do not seed the per-channel fits at the pooled M.  By "
+                        "default the all-50 fit's M seeds every channel, which "
+                        "is faster and much less likely to land on a "
+                        "sub-multiple of the true spacing")
     p.add_argument("--no-pdf", action="store_true",
                    help="only write the pngs, not the matching pdfs")
     p.add_argument("--no-txt", action="store_true",
@@ -1541,26 +1840,18 @@ def main(argv=None):
                          % (col, COLCOLOUR[col]) + stamp))
 
     written = []
-    for cols, png, title, sub in jobs:
-        paths = outputs(png, args.no_pdf)
-        top = make_plot(vals, paths, title, sub, args.xmin, args.xmax,
-                        args.nbins, logy=args.logy, density=args.density,
-                        column=args.column, cols=cols,
-                        per_panel_y=args.per_panel_y)
-        if not args.density and not args.logy:
-            print("y axis     %s: highest bin %.0f -> top %.0f"
-                  % (os.path.basename(png), top, YHEADROOM * top)
-                  if not args.per_panel_y else
-                  "y axis     %s: each panel scaled to its own highest bin"
-                  % os.path.basename(png))
-        written += paths
+    all50_fit = None
+    all50_paths = []
+    per_fits = None
 
     # ---- all 50 active SiPMs in one panel ----
+    # This runs FIRST now: its M seeds every per-channel fit, and those in turn
+    # are drawn on the 4x4 grids below.
     if not args.no_all50:
         png = "%s_all50%s" % (stem, ext)
-        paths = outputs(png, args.no_pdf)
-        nch, nent, top50, fit = make_all50(
-            vals, paths, "%s   photon peaks   all %d active SiPMs"
+        all50_paths = outputs(png, args.no_pdf)
+        nch, nent, top50, all50_fit = make_all50(
+            vals, all50_paths, "%s   photon peaks   all %d active SiPMs"
             % (label, len(ACTIVE_CH)),
             base + ("  |  every active SiPM faint, their mean in black"
                     if args.all50_individual
@@ -1584,25 +1875,99 @@ def main(argv=None):
         if not args.logy:
             print("           highest bin %.1f -> y axis top %.1f"
                   % (top50, YHEADROOM * top50))
+
+    # ---- every SiPM on its own ----
+    if not args.no_per_sipm and not args.no_fit:
+        pooled_m = None
+        if all50_fit and all50_fit.get("ok") and not args.per_sipm_no_seed:
+            pooled_m = all50_fit["gain"]
+        npk = args.per_sipm_npeaks or args.npeaks
+        ngauss = npk + 1 if args.ped_peak else npk
+        i0 = 0 if args.ped_peak else 1
+        t0 = time.time()
+        per_fits = fit_per_sipm(
+            vals, args.xmin, args.xmax, args.nbins,
+            args.fit_xmin, args.fit_xmax if args.fit_xmax else args.xmax,
+            seed_gain_value=pooled_m,
+            npeaks=ngauss, sigma_init=args.sigma_init,
+            sigma_lo=args.sigma_min, sigma_hi=args.sigma_max,
+            n_init=(args.n_init if args.n_init and args.n_init > 0 else None),
+            n_lo=args.n_min, n_hi=args.n_max, bkg_mode=bkg_mode,
+            sig_frac_lo=args.sigma_min_frac, sig_frac_hi=args.sigma_max_frac,
+            i0=i0, ped_init=args.ped_init, ped_lo=args.ped_min,
+            ped_hi=args.ped_max, fix_ped=args.fix_ped)
+        print("           %.1f s" % (time.time() - t0))
+
+    # ---- the combined A-D plot, then one plot per detector column ----
+    for cols, png, title, sub in jobs:
+        paths = outputs(png, args.no_pdf)
+        top = make_plot(vals, paths, title, sub, args.xmin, args.xmax,
+                        args.nbins, logy=args.logy, density=args.density,
+                        column=args.column, cols=cols,
+                        per_panel_y=args.per_panel_y, fits=per_fits)
+        if not args.density and not args.logy:
+            print("y axis     %s: highest bin %.0f -> top %.0f"
+                  % (os.path.basename(png), top, YHEADROOM * top)
+                  if not args.per_panel_y else
+                  "y axis     %s: each panel scaled to its own highest bin"
+                  % os.path.basename(png))
         written += paths
-        if fit is not None:
-            report = fit_report(fit)
-            for line in report:
-                print(line)
-            if not args.no_txt:
-                txt = "%s_fit.txt" % stem
-                with open(txt, "w") as f:
-                    f.write("file   %s\n" % os.path.abspath(args.listfile))
-                    f.write("runs   %s\n"
-                            % (", ".join(runs) if runs else "(none parsed)"))
-                    f.write("events %d used of %d seen (first %d skipped)\n"
-                            % (nused, nseen, args.skip_events))
-                    if "Run start time" in header:
-                        f.write("start  %s\n" % header["Run start time"])
-                    f.write("\n")
-                    f.write("\n".join(report))
-                    f.write("\n")
-                written.append(txt)
+    written += all50_paths
+
+    # ---- the 16 x 4 map of M, and the per-channel table ----
+    if per_fits is not None:
+        pooled_m = all50_fit["gain"] if (all50_fit
+                                         and all50_fit.get("ok")) else None
+        map_png = "%s_gainMap%s" % (stem, ext)
+        written += make_gain_map(
+            per_fits, outputs(map_png, args.no_pdf),
+            "%s   %s ADC counts per photoelectron, per SiPM"
+            % (label, args.column),
+            base + stamp, column=args.column, pooled=pooled_m)
+
+        table = per_sipm_lines(per_fits, pooled_m)
+        print("-" * 78)
+        for line in table:
+            print(line)
+        print("-" * 78)
+        if not args.no_txt:
+            txt = "%s_perSiPM.txt" % stem
+            with open(txt, "w") as f:
+                f.write("file   %s\n" % os.path.abspath(args.listfile))
+                f.write("runs   %s\n"
+                        % (", ".join(runs) if runs else "(none parsed)"))
+                f.write("events %d used of %d seen (first %d skipped)\n"
+                        % (nused, nseen, args.skip_events))
+                f.write("column %s,  fit over %g to %g ADC\n"
+                        % (args.column, args.fit_xmin,
+                           args.fit_xmax if args.fit_xmax else args.xmax))
+                f.write("\nNOTE ch2-5 are A1, C1, A2, C2 in this script's "
+                        "channel map (Sept 9) but TrigA,\n"
+                        "     TrigC, TrigB, TrigD on the Sept 14 sheet.  "
+                        "Neither is fitted either way.\n\n")
+                f.write("\n".join(table))
+                f.write("\n")
+            written.append(txt)
+
+    # ---- the pooled fit report ----
+    if all50_fit is not None:
+        report = fit_report(all50_fit)
+        for line in report:
+            print(line)
+        if not args.no_txt:
+            txt = "%s_fit.txt" % stem
+            with open(txt, "w") as f:
+                f.write("file   %s\n" % os.path.abspath(args.listfile))
+                f.write("runs   %s\n"
+                        % (", ".join(runs) if runs else "(none parsed)"))
+                f.write("events %d used of %d seen (first %d skipped)\n"
+                        % (nused, nseen, args.skip_events))
+                if "Run start time" in header:
+                    f.write("start  %s\n" % header["Run start time"])
+                f.write("\n")
+                f.write("\n".join(report))
+                f.write("\n")
+            written.append(txt)
 
     print("-" * 78)
     for path in written:
