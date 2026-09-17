@@ -127,9 +127,17 @@ for _ch, (_col, _ring) in CHMAP.items():
     if RING_LO <= _ring <= RING_HI:
         CELL[_ch] = (COLS.index(_col), RING_HI - _ring)
 
-TRIG_CH = tuple(range(6))        # CW top, CW bottom, CWA, CWB, CWC, CWD
-TRIG_NAME = {0: "CW top", 1: "CW bottom", 2: "CWA", 3: "CWB", 4: "CWC",
-             5: "CWD"}
+TRIG_CH = tuple(range(6))
+# Sept 14 assignment.  Note ch3 is TrigC and ch4 is TrigB -- B and C are the
+# other way round from the older CWB/CWC labels, so a printout from before
+# Sept 14 names those two channels differently.  Only the labels moved; the
+# required set below is still ch2-5, so the AND is unaffected.
+TRIG_NAME = {0: "TrigE", 1: "TrigF", 2: "TrigA", 3: "TrigC", 4: "TrigB",
+             5: "TrigD"}
+
+# the full detector grid, before the ring cut: 16 rings x 4 columns
+NRING_ALL = 16
+RING_ALL_HI = NRING_ALL - 1
 
 
 def fired_trigger_channels(hg, lg, hgmin=TRIG_HG_MIN, lgmin=TRIG_LG_MIN):
@@ -309,6 +317,141 @@ def show_event(n, trgid, img, res, nsat, min_photons, nedge,
 
 
 # ----------------------------------------------------------------------------
+# the average-photon map
+# ----------------------------------------------------------------------------
+def channel_grid(avg):
+    """avg[ch] -> a (16, 4) grid, ring 15 on the top row, columns A B C D.
+
+    Positions with no channel behind them -- A0-A2 and C0-C2, the six corners
+    of the 64-cell grid that the 58 SiPMs do not fill -- come back as None and
+    are drawn grey.
+    """
+    grid = [[None] * len(COLS) for _ in range(NRING_ALL)]
+    for ch, (col, ring) in CHMAP.items():
+        if 0 <= ring < NRING_ALL:
+            grid[RING_ALL_HI - ring][COLS.index(col)] = avg[ch]
+    return grid
+
+
+def write_photon_map(out_stem, sum_ph, nev, scope, src, args):
+    """Average photons per channel as a 16 x 4 image, triggers on the left.
+
+    Written on every run, PNG and PDF.  matplotlib is imported here rather
+    than at the top so that a machine without it can still do the conversion:
+    the map is a diagnostic, not the product.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize
+        import numpy as np
+    except ImportError as exc:
+        print("  no photon map: %s (matplotlib/numpy not available)" % exc)
+        return []
+
+    if not nev:
+        print("  no photon map: no events were %s" % scope)
+        return []
+
+    avg = [v / float(nev) for v in sum_ph]
+    grid = np.array([[np.nan if v is None else v for v in row]
+                     for row in channel_grid(avg)], dtype=float)
+    trig = np.array([[avg[c]] for c in TRIG_CH], dtype=float)
+
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad("#d0d0d0")                 # the unassigned cells
+    vmax = float(np.nanmax(grid)) if np.isfinite(grid).any() else 1.0
+    norm = Normalize(vmin=0.0, vmax=max(vmax, 1e-9))
+    # the paddles collect far more light than a SiPM, so putting them on the
+    # SiPM scale would saturate them and flatten the grid.  They get their own
+    # normalisation and every cell carries its number.
+    tnorm = Normalize(vmin=0.0, vmax=max(float(trig.max()), 1e-9))
+
+    fig = plt.figure(figsize=(8.6, 11.0))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.0, 4.4, 0.2], wspace=0.30,
+                          left=0.115, right=0.895, top=0.842, bottom=0.05)
+    ax_t = fig.add_subplot(gs[0, 0])
+    ax = fig.add_subplot(gs[0, 1])
+    ax_cb = fig.add_subplot(gs[0, 2])
+
+    def cell_text(v, n):
+        lum = 0.299 * n[0] + 0.587 * n[1] + 0.114 * n[2]
+        return "black" if lum > 0.55 else "white"
+
+    # ---- the 6 trigger channels ----
+    ax_t.imshow(trig, cmap=cmap, norm=tnorm, aspect="auto",
+                extent=[0, 1, len(TRIG_CH), 0], interpolation="nearest")
+    for i, c in enumerate(TRIG_CH):
+        ax_t.text(0.5, i + 0.5, "%.0f" % avg[c], ha="center", va="center",
+                  fontsize=8.5, color=cell_text(avg[c], cmap(tnorm(avg[c]))))
+    ax_t.set_xticks([])
+    ax_t.set_yticks([i + 0.5 for i in range(len(TRIG_CH))])
+    ax_t.set_yticklabels(["ch%d  %s" % (c, TRIG_NAME[c]) for c in TRIG_CH],
+                         fontsize=8.5)
+    ax_t.set_yticks(range(len(TRIG_CH) + 1), minor=True)
+    ax_t.grid(which="minor", color="white", lw=1.0)
+    ax_t.tick_params(which="both", length=0)
+    ax_t.set_title("trigger\n(own scale)", fontsize=9.5)
+
+    # ---- the 16 x 4 SiPM grid ----
+    im = ax.imshow(np.ma.masked_invalid(grid), cmap=cmap, norm=norm,
+                   aspect="auto", extent=[0, len(COLS), 0, NRING_ALL],
+                   interpolation="nearest")
+    for r in range(NRING_ALL):
+        ring = RING_ALL_HI - r
+        for c in range(len(COLS)):
+            v = grid[r, c]
+            y = NRING_ALL - r - 0.5
+            if not np.isfinite(v):
+                ax.text(c + 0.5, y, "n/c", ha="center", va="center",
+                        fontsize=7.5, color="#707070")
+                continue
+            ax.text(c + 0.5, y, "%.1f" % v, ha="center", va="center",
+                    fontsize=8, color=cell_text(v, cmap(norm(v))))
+    ax.set_xticks([c + 0.5 for c in range(len(COLS))])
+    ax.set_xticklabels(COLS, fontsize=11)
+    ax.xaxis.tick_top()
+    ax.set_yticks([NRING_ALL - r - 0.5 for r in range(NRING_ALL)])
+    ax.set_yticklabels([str(RING_ALL_HI - r) for r in range(NRING_ALL)],
+                       fontsize=8)
+    ax.set_ylabel("detector ring", fontsize=10)
+    ax.set_xticks(range(len(COLS) + 1), minor=True)
+    ax.set_yticks(range(NRING_ALL + 1), minor=True)
+    ax.grid(which="minor", color="white", lw=0.8)
+    ax.tick_params(which="minor", length=0)
+    ax.tick_params(which="major", length=2)
+
+    # the rings that actually reach the 4 x 11 output.  Just the line: any
+    # label here lands on a row of numbers, so it goes in the caption instead.
+    ax.axhline(RING_LO, color="#cc3311", lw=2.0)
+
+    cb = fig.colorbar(im, cax=ax_cb)
+    cb.set_label("average photons / event", fontsize=9)
+    cb.ax.tick_params(labelsize=8)
+
+    fig.suptitle("%s   -   average photons per channel"
+                 % os.path.basename(src), fontsize=13, y=0.972)
+    fig.text(0.5, 0.928,
+             "%d events %s   |   photons = HG/%g, or (LG*%g)/%g when HG > %g"
+             "\ngrey = no channel assigned (A0-A2, C0-C2);  "
+             "Sept 14 channel assignment"
+             "\nred line: rings %d-%d go to the 4 x %d output, rings %d-%d "
+             "are dropped"
+             % (nev, scope, args.adc_per_photon, args.lg_scale,
+                args.adc_per_photon, args.hg_sat,
+                RING_LO, RING_HI, NRING, 0, RING_LO - 1),
+             ha="center", va="top", fontsize=8.5, color="0.25",
+             linespacing=1.5)
+
+    paths = [out_stem + ".png", out_stem + ".pdf"]
+    for p in paths:
+        fig.savefig(p, dpi=150)
+    plt.close(fig)
+    return paths
+
+
+# ----------------------------------------------------------------------------
 def main(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -360,6 +503,18 @@ def main(argv=None):
                         "arrival-time array.  Makes the output readable by "
                         "the CNN loader as it stands (skip_leading_blocks=1)"
                         % NRING)
+    p.add_argument("--map-out", default=None, metavar="STEM",
+                   help="output stem for the average-photon map (default: the "
+                        "output text file's name with _avgPhotons)")
+    p.add_argument("--no-map", action="store_true",
+                   help="do not write the average-photon map.  By default a "
+                        "16 x 4 image of the average photons per channel, "
+                        "with the six trigger channels on the left, is written "
+                        "as PNG and PDF on every run")
+    p.add_argument("--map-selected", action="store_true",
+                   help="average the map over the events WRITTEN to the "
+                        "output instead of over every event read, i.e. after "
+                        "the trigger and photon cuts")
     p.add_argument("--no-select", action="store_true",
                    help="convert every event, applying neither selection")
     p.add_argument("--max-events", type=int, default=None,
@@ -433,6 +588,11 @@ def main(argv=None):
               % (args.edge - 1, NRING - args.edge, NRING - 1))
     print("=" * 78)
 
+    # running sum of photons per channel, for the map.  All 64 channels, not
+    # just the 44 that reach the output, and streamed like everything else.
+    sum_ph = [0.0] * NCH
+    n_map = 0
+
     n = nt = n1 = n12 = nsat_tot = 0
     nfired_hist = [0] * (len(required) + 1)     # among the REQUIRED channels
     # per-channel fire counts over all six, so a dead paddle is obvious: an
@@ -457,6 +617,13 @@ def main(argv=None):
             nfired_hist[nreq] += 1
             trig_ok = (not args.requireTrigger) or nreq >= need
 
+            if not args.no_map and not args.map_selected:
+                n_map += 1
+                for c in range(NCH):
+                    sum_ph[c] += photons(hg.get(c), lg.get(c),
+                                         args.adc_per_photon, args.lg_scale,
+                                         args.hg_sat)
+
             img, nsat = make_image(hg, lg, args.adc_per_photon,
                                    args.lg_scale, args.hg_sat)
             nsat_tot += nsat
@@ -480,6 +647,13 @@ def main(argv=None):
                 n1 += 1
                 if res["pass2"]:
                     n12 += 1
+
+            if keep and not args.no_map and args.map_selected:
+                n_map += 1
+                for c in range(NCH):
+                    sum_ph[c] += photons(hg.get(c), lg.get(c),
+                                         args.adc_per_photon, args.lg_scale,
+                                         args.hg_sat)
 
             if keep:
                 out.write("%d\n" % trgid)
@@ -547,6 +721,14 @@ def main(argv=None):
               "threshold.")
     print("=" * 78)
     print("wrote %s" % out_path)
+
+    if not args.no_map:
+        map_stem = args.map_out or (
+            (out_path[:-4] if out_path.lower().endswith(".txt") else out_path)
+            + "_avgPhotons")
+        scope = "written to the output" if args.map_selected else "read"
+        for pth in write_photon_map(map_stem, sum_ph, n_map, scope, src, args):
+            print("wrote %s" % pth)
     return 0
 
 
