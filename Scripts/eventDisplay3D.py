@@ -1095,14 +1095,19 @@ class Display:
         return trig_placements(self.phi_sense, self.track_z0, self.trig_dist)
 
     def home_view(self):
-        """Three-quarter view framed on the detector, not on the track.
+        """Slightly raised view framed on the detector, not on the track.
 
+        The camera sits on the -y axis looking along +y with z up, so +x runs
+        exactly left-to-right across the screen and +z exactly up.  Screen
+        right is (direction x view-up), so x lands on the horizontal only when
+        the camera has no x offset; any azimuthal swing would tilt it.  The
+        small +z offset keeps a little of the top of the cylinder in view.
 
         reset_camera() would fit the muon line as well, which is twice as long
         as the cylinder and would leave the detector tiny in the middle.
         """
         self.mid()
-        self.pl.camera_position = [(1.35, -1.15, 0.58), (0, 0, 0), (0, 0, 1)]
+        self.pl.camera_position = [(0.0, -1.77, 0.58), (0, 0, 0), (0, 0, 1)]
         z_top = ring_z(N_RING - 1) + 5.1          # the connector end
         z_bot = z_top - PCB_LEN
         rad = R_PCB * 2.0
@@ -1410,7 +1415,7 @@ def main(argv=None):
     p.add_argument("--no-compass", action="store_true",
                    help="hide the brass bearing ring, its A/B/C/D board tags "
                         "and the gold phi needle")
-    p.add_argument("--size", type=int, nargs=2, default=[3800, 2000],
+    p.add_argument("--size", type=int, nargs=2, default=[2850, 1500],
                    metavar=("W", "H"), help="window / image size")
     args = p.parse_args(argv)
 
