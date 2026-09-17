@@ -37,6 +37,7 @@ Keys
     Left  / p    previous event, back to the setup view
     Home         the setup view again
     Return       save the window as <event>.png and <event>.pdf
+    a            replay the flight, with --animate
     r            reset the camera
     s / w        surface / wireframe
     q            quit
@@ -125,6 +126,29 @@ detector centre would give, which is what you would expect once the light
 spreads and the tracks are spread over impact parameter.  The -0.44 offset is
 a common-mode board asymmetry and does not affect the sign.)
 
+Scintillation photons
+---------------------
+--showPhotons draws the light.  Photons are emitted at random points along the
+chord the muon cuts through the cylinder, at --nPhotonsPerCM per cm (default
+100), isotropically, and each line stops where it meets the wall or an end cap.
+They are drawn at 420 nm, the emission peak of the plastic.
+
+This is a picture of an isotropic emitter, not a light-collection simulation:
+the lines are straight, and there is no refraction at the wall, no reflection,
+no attenuation and no wrapping.  Do not read the density at the wall as the
+number of photons a SiPM would see.
+
+--animate flies the muon along its track instead of drawing it finished: the
+line grows from the entry point, and each photon appears as the muon reaches
+its emission point and spreads outward behind it.  --speed sets the pace in
+cm/s (default 12, about 3.8 s for the 46 cm of drawn track) and the photons
+travel at that same pace, which is the other place the picture parts company
+with the physics -- real scintillation light would cross the 7.5 cm cylinder
+in about 0.4 ns, some 10^10 times faster than the muon covers the same ground.
+Equal speeds are what make the light legible as it goes.  A window is needed
+for the clock, so --animate is ignored for --screenshot and --html; 'a'
+replays the event on screen.
+
 Web
 ---
 --html writes a self-contained page (vtk.js under the hood) that rotates,
@@ -138,6 +162,8 @@ import glob
 import os
 import sys
 import tempfile
+
+import time
 
 import numpy as np
 import pyvista as pv
@@ -168,6 +194,30 @@ GAP = 0.25                   # air gap between scintillator and board
 R_PCB_IN = R_CYL + GAP                        # inner face of the board
 R_PCB = R_PCB_IN + PCB_THICK / 2.0            # board centre
 R_SIPM = R_PCB                                # drawn centred on the board
+
+# ---- scintillation photons (--showPhotons) ---------------------------------
+PHOTON_NM = 420.0            # emission peak of the plastic, in nanometres
+PHOTONS_PER_CM = 100.0       # lines per cm of track inside the scintillator
+PHOTON_OPACITY = 0.30        # a thousand opaque lines is a solid ball of light
+# VTK quantises line width to quarter-pixel steps -- 1.0, 1.25, 1.5 ... render
+# distinguishably, anything between them does not -- so this is one step up
+# from a hairline, the smallest increase that actually reaches the screen.
+PHOTON_WIDTH = 1.25
+# A hard ceiling on the lines drawn.  A near-vertical track cuts a 30 cm chord,
+# which at a few hundred per cm would stall the interaction, so past this the
+# same chord is shown with fewer photons rather than slowly.
+PHOTON_MAX = 6000
+
+# ---- the drawn muon, and the animation of it (--animate) -------------------
+MUON_HALF_LEN = 23.0         # the track is drawn this far either side of z0
+MUON_MIN_ARC = 0.02          # a tube needs a length; frame zero gets this one
+# Centimetres per second along the track, and the photons travel at the same
+# speed -- a light-speed photon would be at the wall before the eye caught it,
+# so this is a deliberate slow-motion, not a time-of-flight statement.  The
+# track is 2 x MUON_HALF_LEN long, so the default crossing takes about 3.8 s.
+ANIM_SPEED = 12.0
+ANIM_FRAME_MS = 33           # ~30 frames a second
+ANIM_MAX_STEPS = 10 ** 7     # the timer runs for the life of the window
 
 COLS = ["A", "B", "C", "D"]
 COL_PHI = {"A": 0.0, "B": 90.0, "C": 180.0, "D": 270.0}
@@ -462,7 +512,31 @@ def build_halo(counts, frac=0.12):
     return pv.MultiBlock(blocks).combine() if blocks else None
 
 
-def muon_meshes(theta_deg, phi_deg, length=23.0, phi_sense="to", z0=TRACK_Z0):
+def muon_entry(theta_deg, phi_deg, phi_sense="to", z0=TRACK_Z0,
+               length=MUON_HALF_LEN):
+    """(entry point, direction) of the drawn track: where the muon comes in."""
+    u = muon_axis(theta_deg, phi_deg, phi_sense)
+    return -u * length + np.array([0.0, 0.0, float(z0)]), u
+
+
+def muon_arc_meshes(entry_pt, u, arc):
+    """Track tube, arrow head and bloom tube for a muon `arc` cm past entry.
+
+    Each piece has the same topology whatever the arc, which is what lets the
+    animation copy a new frame straight into the meshes already on screen.
+    """
+    arc = max(float(arc), MUON_MIN_ARC)
+    head_pt = np.asarray(entry_pt, dtype=float) + arc * u
+    track = pv.Line(entry_pt, head_pt).tube(radius=0.085, n_sides=20)
+    head = pv.Cone(center=head_pt - u * 0.9, direction=u, height=1.8,
+                   radius=0.42, resolution=24)
+    # a faint fat tube around the track, same bloom trick as the SiPMs
+    bloom = pv.Line(entry_pt, head_pt).tube(radius=0.30, n_sides=16)
+    return track, head, bloom
+
+
+def muon_meshes(theta_deg, phi_deg, length=MUON_HALF_LEN, phi_sense="to",
+                z0=TRACK_Z0):
     """The muon as a line through the detector axis at z0, plus an arrow head.
 
     theta is the zenith angle (0 = straight down the axis) and phi the
@@ -484,29 +558,186 @@ def muon_meshes(theta_deg, phi_deg, length=23.0, phi_sense="to", z0=TRACK_Z0):
       "from"  phi is the azimuth the muon ARRIVES FROM.  The same line rotated
               180 deg in azimuth.
     """
+    entry_pt, u = muon_entry(theta_deg, phi_deg, phi_sense, z0, length)
+    track, head, _ = muon_arc_meshes(entry_pt, u, 2.0 * length)
+    entry = pv.Sphere(radius=0.28, center=entry_pt)
+    return track, head, entry
+
+
+def wavelength_rgb(nm, gamma=0.8):
+    """Approximate sRGB hex for a monochromatic wavelength (Bruton's map).
+
+    Only ever called on the 420 nm scintillation peak, but written out so the
+    colour follows from the wavelength instead of being a hex string that has
+    to be taken on trust.  420 nm lands in the violet-blue corner of sRGB; a
+    monitor cannot really show a spectral line, so this is the usual polite
+    fiction, not a colorimetric statement.
+    """
+    nm = float(nm)
+    if 380.0 <= nm < 440.0:
+        rgb = [-(nm - 440.0) / 60.0, 0.0, 1.0]
+    elif 440.0 <= nm < 490.0:
+        rgb = [0.0, (nm - 440.0) / 50.0, 1.0]
+    elif 490.0 <= nm < 510.0:
+        rgb = [0.0, 1.0, -(nm - 510.0) / 20.0]
+    elif 510.0 <= nm < 580.0:
+        rgb = [(nm - 510.0) / 70.0, 1.0, 0.0]
+    elif 580.0 <= nm < 645.0:
+        rgb = [1.0, -(nm - 645.0) / 65.0, 0.0]
+    elif 645.0 <= nm <= 780.0:
+        rgb = [1.0, 0.0, 0.0]
+    else:
+        rgb = [0.0, 0.0, 0.0]
+    # the eye rolls off at both ends of the visible band
+    if 380.0 <= nm < 420.0:
+        f = 0.3 + 0.7 * (nm - 380.0) / 40.0
+    elif 700.0 < nm <= 780.0:
+        f = 0.3 + 0.7 * (780.0 - nm) / 80.0
+    elif 420.0 <= nm <= 700.0:
+        f = 1.0
+    else:
+        f = 0.0
+    from matplotlib.colors import to_hex
+    return to_hex([(c * f) ** gamma if c > 0 else 0.0 for c in rgb])
+
+
+PHOTON_COLOUR = None                          # filled in on first use
+
+
+def photon_colour():
+    global PHOTON_COLOUR
+    if PHOTON_COLOUR is None:
+        PHOTON_COLOUR = wavelength_rgb(PHOTON_NM)
+    return PHOTON_COLOUR
+
+
+def cylinder_span(p, d, radius=R_CYL, half_h=H_CYL / 2.0):
+    """(t_in, t_out) for which p + t*d lies inside the closed cylinder.
+
+    None when the line misses it altogether.  The side wall gives a quadratic
+    in t and the two end caps give a slab in z; the inside is where the two
+    intervals overlap, which is what keeps a nearly-horizontal line from being
+    cut at the wall of the infinite cylinder far above the real one.
+    """
+    p = np.asarray(p, dtype=float)
+    d = np.asarray(d, dtype=float)
+    lo, hi = -np.inf, np.inf
+
+    a = d[0] * d[0] + d[1] * d[1]
+    c = p[0] * p[0] + p[1] * p[1] - radius * radius
+    if a < 1e-12:                              # parallel to the axis
+        if c > 0.0:
+            return None
+    else:
+        b = 2.0 * (p[0] * d[0] + p[1] * d[1])
+        disc = b * b - 4.0 * a * c
+        if disc <= 0.0:
+            return None
+        s = np.sqrt(disc)
+        lo, hi = (-b - s) / (2.0 * a), (-b + s) / (2.0 * a)
+
+    if abs(d[2]) < 1e-12:                      # perpendicular to the axis
+        if abs(p[2]) > half_h:
+            return None
+    else:
+        t1 = (-half_h - p[2]) / d[2]
+        t2 = (half_h - p[2]) / d[2]
+        lo, hi = max(lo, min(t1, t2)), min(hi, max(t1, t2))
+
+    return None if hi <= lo else (lo, hi)
+
+
+def scintillation_photons(theta_deg, phi_deg, phi_sense="to", z0=TRACK_Z0,
+                          per_cm=PHOTONS_PER_CM, seed=0, max_n=PHOTON_MAX,
+                          length=MUON_HALF_LEN):
+    """Photons from the muon's path through the scintillator, as four arrays.
+
+    Returns (starts, dirs, ranges, emitted_at), or None when the track misses
+    the scintillator: where each photon began, the unit vector it left on, how
+    far it can go before it meets the wall or an end cap, and how far the muon
+    had travelled from the top of its drawn track when it was emitted.  Kept
+    as arrays rather than a mesh because the animation has to redraw them at a
+    new length thirty times a second; photon_lines() turns them into geometry.
+
+    Emission points are scattered at random along the chord the track cuts
+    through the cylinder -- and only along that chord, so nothing is emitted
+    in the air above it or in the boards -- and each photon leaves in a random
+    isotropic direction and stops where it meets the wall or an end cap.
+
+    The lines are what an isotropic emitter looks like, not a light-collection
+    simulation: they are drawn straight, with no refraction at the wall, no
+    reflection off it, no attenuation along the way and no wrapping, so the
+    picture says where the light goes, not how much of it reaches a SiPM.
+
+    The generator is seeded per event, so stepping away from an event and back
+    redraws the same photons rather than reshuffling them.
+    """
+    u = muon_axis(theta_deg, phi_deg, phi_sense)
+    p0 = np.array([0.0, 0.0, float(z0)])
+    span = cylinder_span(p0, u)
+    if span is None:                           # track misses the scintillator
+        return None
+    t_in, t_out = span
+    chord = t_out - t_in                       # u is a unit vector, so cm
+    n = int(round(float(per_cm) * chord))
+    if n <= 0:
+        return None
+    n = min(n, int(max_n))
+
+    rng = np.random.default_rng(seed)
+    t = t_in + chord * rng.random(n)
+    starts = p0 + np.outer(t, u)
+    # isotropic: cos(polar) flat in [-1, 1], azimuth flat in [0, 2pi).  Taking
+    # the polar angle itself flat would crowd the photons at the poles.
+    cz = rng.uniform(-1.0, 1.0, n)
+    sz = np.sqrt(np.maximum(0.0, 1.0 - cz * cz))
+    az = rng.uniform(0.0, 2.0 * np.pi, n)
+    dirs = np.c_[sz * np.cos(az), sz * np.sin(az), cz]
+
+    ranges = np.empty(n)
+    for i in range(n):
+        sp = cylinder_span(starts[i], dirs[i])
+        ranges[i] = max(sp[1], 0.0) if sp else 0.0
+
+    # t runs from the axis crossing; the drawn track starts `length` before it
+    return starts, dirs, ranges, t + float(length)
+
+
+def photon_lines(starts, dirs, lengths):
+    """One segment per photon, at the given lengths, as a single mesh.
+
+    The topology never changes with `lengths`, so the animation can push a new
+    set of points into the mesh it is already showing instead of building an
+    actor a frame.
+    """
+    n = len(starts)
+    pts = np.empty((2 * n, 3))
+    pts[0::2] = starts
+    pts[1::2] = starts + np.asarray(lengths)[:, None] * dirs
+    lines = np.column_stack([np.full(n, 2), np.arange(0, 2 * n, 2),
+                             np.arange(1, 2 * n, 2)]).ravel()
+    return pv.PolyData(pts, lines=lines)
+
+
+def muon_axis(theta_deg, phi_deg, phi_sense="to"):
+    """Unit vector along a muon's direction of travel.  Always down-going.
+
+    theta is the zenith angle and phi the azimuth; `phi_sense` says whether
+    phi is the azimuth travelled towards ("to") or arrived from ("from"), as
+    muon_meshes explains at length.
+    """
     t, p = np.radians(theta_deg), np.radians(phi_deg)
     # unit vector pointing up-and-out along azimuth phi
     a = np.array([np.sin(t) * np.cos(p), np.sin(t) * np.sin(p), np.cos(t)])
     if phi_sense == "to":
         # down-going, azimuth phi: mirror the horizontal part, keep it falling
-        u = np.array([a[0], a[1], -a[2]])
-    else:
-        u = -a                                     # down-going, away from phi
-    shift = np.array([0.0, 0.0, float(z0)])
-    entry_pt = -u * length + shift                 # always top -> bottom
-    exit_pt = u * length + shift
-    track = pv.Line(entry_pt, exit_pt).tube(radius=0.085, n_sides=20)
-    head = pv.Cone(center=exit_pt - u * 0.9, direction=u, height=1.8,
-                   radius=0.42, resolution=24)
-    entry = pv.Sphere(radius=0.28, center=entry_pt)
-    return track, head, entry
+        return np.array([a[0], a[1], -a[2]])
+    return -a                                      # down-going, away from phi
 
 
 def trig_axis(phi_sense="to", theta=TRIG_THETA, phi=TRIG_PHI):
     """Unit vector along the accepted muon's direction of travel."""
-    t, p = np.radians(theta), np.radians(phi)
-    a = np.array([np.sin(t) * np.cos(p), np.sin(t) * np.sin(p), np.cos(t)])
-    return np.array([a[0], a[1], -a[2]]) if phi_sense == "to" else -a
+    return muon_axis(theta, phi, phi_sense)
 
 
 def trig_placements(phi_sense="to", z0=TRACK_Z0, dist=TRIG_DIST,
@@ -923,7 +1154,9 @@ class Display:
                  off_screen=False, window_size=(1280, 960), halo=True,
                  phi_sense="to", compass=True, track_z0=TRACK_Z0,
                  triggers=True, trig_dist=TRIG_DIST, panels=True,
-                 savedir="."):
+                 savedir=".", show_photons=False,
+                 photons_per_cm=PHOTONS_PER_CM, animate=False,
+                 speed=ANIM_SPEED):
         self.events = events
         self.i = -1                              # -1 = the bare detector
         self.cmap = cmap
@@ -936,6 +1169,13 @@ class Display:
         self.trig_dist = float(trig_dist)
         self.compass = compass
         self.panels = panels
+        self.show_photons = bool(show_photons)
+        self.photons_per_cm = float(photons_per_cm)
+        # An animation needs a window with a clock in it.  A screenshot or a
+        # web page gets the finished track instead, not frame zero of one.
+        self.animate = bool(animate) and not off_screen
+        self.speed = float(speed)
+        self._anim = None                        # the flight in progress
         self.window_size = tuple(window_size)
         self._tmp = tempfile.mkdtemp(prefix="evd3d_")
         self._panel_actor = {}                   # textured plane per side
@@ -997,11 +1237,22 @@ class Display:
         self.pl.add_point_labels(tpos, ttxt, font_size=self.hud_size(11),
                                  text_color=HUD, shape=None,
                                  show_points=False, always_visible=True)
+        # The timer goes in before the first draw, so that a VTK build without
+        # one falls back to finished tracks rather than to frozen stubs.
+        if self.animate:
+            try:
+                self.pl.add_timer_event(max_steps=ANIM_MAX_STEPS,
+                                        duration=ANIM_FRAME_MS,
+                                        callback=self._anim_frame)
+            except Exception:
+                self.animate = False
+
         for key in ("Right", "n"):
             self.pl.add_key_event(key, self.next)
         for key in ("Left", "p"):
             self.pl.add_key_event(key, self.prev)
         self.pl.add_key_event("Home", self.setup)
+        self.pl.add_key_event("a", self.replay)
         for key in ("Return", "KP_Enter"):
             self.pl.add_key_event(key, self.save_view)
         self.draw()
@@ -1317,22 +1568,48 @@ class Display:
                     reset_camera=False, ambient=0.55, diffuse=0.7,
                     specular=1.0, specular_power=70, show_scalar_bar=False))
 
-        track, head, entry = muon_meshes(ev["theta"], ev["phi"],
-                                         phi_sense=self.phi_sense,
-                                         z0=self.track_z0)
+        # The muon and its light are the two things that move.  Animated, they
+        # are put on screen at the start of the flight and grown in place by
+        # the timer; otherwise the same meshes are simply built finished.
+        full_arc = 2.0 * MUON_HALF_LEN
+        arc0 = MUON_MIN_ARC if self.animate else full_arc
+        entry_pt, u = muon_entry(ev["theta"], ev["phi"], self.phi_sense,
+                                 self.track_z0)
+
+        photons = None
+        if self.show_photons:
+            photons = scintillation_photons(ev["theta"], ev["phi"],
+                                            phi_sense=self.phi_sense,
+                                            z0=self.track_z0,
+                                            per_cm=self.photons_per_cm,
+                                            seed=int(ev["trgid"]))
+        ph_mesh = None
+        if photons is not None:
+            starts, dirs, ranges, _ = photons
+            ph_mesh = photon_lines(starts, dirs,
+                                   np.zeros(len(starts)) if self.animate
+                                   else ranges)
+            self.dynamic.append(self.pl.add_mesh(
+                ph_mesh, color=photon_colour(), opacity=PHOTON_OPACITY,
+                line_width=PHOTON_WIDTH, lighting=False,
+                reset_camera=False, show_scalar_bar=False))
+
+        track, head, bloom = muon_arc_meshes(entry_pt, u, arc0)
+        entry = pv.Sphere(radius=0.28, center=entry_pt)
         for m, op in ((track, 1.0), (head, 1.0), (entry, 0.9)):
             self.dynamic.append(self.pl.add_mesh(
                 m, color=MUON, smooth_shading=True, opacity=op,
                 reset_camera=False,
                 ambient=0.75, diffuse=0.5, specular=1.0, specular_power=60,
                 show_scalar_bar=False))
-        # a faint fat tube around the track, same bloom trick as the SiPMs
         self.dynamic.append(self.pl.add_mesh(
-            pv.Line(*[p for p in (track.points[0], track.points[-1])])
-              .tube(radius=0.30, n_sides=16),
-            color=MUON, opacity=0.10, ambient=1.0, diffuse=0.0,
-            reset_camera=False,
-            show_scalar_bar=False))
+            bloom, color=MUON, opacity=0.10, ambient=1.0, diffuse=0.0,
+            reset_camera=False, show_scalar_bar=False))
+
+        if self.animate:
+            self._anim = dict(t0=time.time(), entry=entry_pt, u=u,
+                              full=full_arc, track=track, head=head,
+                              bloom=bloom, photons=photons, ph_mesh=ph_mesh)
 
         self.dynamic.append(self.add_hud(
             hud_text(ev, counts, self.phi_sense), "upper_left", HUD_BASE,
@@ -1342,6 +1619,42 @@ class Display:
         self.dynamic.append(self.add_hud(foot, "lower_left", FOOT_BASE,
                                          "#5d7d8a"))
         self.pl.render()
+
+    # -- the flight ---------------------------------------------------------
+    def _anim_frame(self, step=0):
+        """One frame of --animate: the track grows, the light follows it out.
+
+        Driven off the wall clock rather than off the frame count, so --speed
+        stays centimetres per second even when the frame rate sags.
+        """
+        a = self._anim
+        if a is None:
+            return
+        arc = self.speed * (time.time() - a["t0"])
+        done = arc >= a["full"]
+        arc = min(arc, a["full"])
+
+        track, head, bloom = muon_arc_meshes(a["entry"], a["u"], arc)
+        a["track"].copy_from(track)
+        a["head"].copy_from(head)
+        a["bloom"].copy_from(bloom)
+
+        if a["ph_mesh"] is not None:
+            starts, dirs, ranges, emitted_at = a["photons"]
+            # The photons travel at the muon's own speed, so how far one has
+            # got is simply how far the muon has come since emitting it --
+            # negative for light not emitted yet, and clipped at the wall.
+            grown = np.clip(arc - emitted_at, 0.0, ranges)
+            a["ph_mesh"].points = photon_lines(starts, dirs, grown).points
+
+        if done:
+            self._anim = None                    # leaves the finished track up
+        self.pl.render()
+
+    def replay(self):
+        """Fly the muon through again, for the event already on screen."""
+        if self.animate and self.i >= 0:
+            self.draw()
 
     def draw_setup(self):
         """The bare detector: no muon, no light, no phi needle."""
@@ -1499,6 +1812,28 @@ def main(argv=None):
     p.add_argument("--no-compass", action="store_true",
                    help="hide the brass bearing ring, its A/B/C/D board tags "
                         "and the gold phi needle")
+    p.add_argument("--showPhotons", "--show-photons", dest="show_photons",
+                   action="store_true",
+                   help="draw scintillation photons: straight lines from the "
+                        "muon's path inside the cylinder, isotropic, each "
+                        "stopping where it meets the wall or an end cap "
+                        "(default off)")
+    p.add_argument("--nPhotonsPerCM", "--photons-per-cm", dest="photons_per_cm",
+                   type=float, default=PHOTONS_PER_CM, metavar="N",
+                   help="photons drawn per cm of track inside the "
+                        "scintillator (default %g); at most %d lines in all"
+                        % (PHOTONS_PER_CM, PHOTON_MAX))
+    p.add_argument("--animate", action="store_true",
+                   help="fly the muon along its track when an event is "
+                        "loaded, the photons spreading out behind it as it "
+                        "crosses the scintillator; 'a' replays it.  Needs a "
+                        "window, so it is ignored for --screenshot and --html")
+    p.add_argument("--speed", type=float, default=ANIM_SPEED, metavar="CM_S",
+                   help="how fast the muon and its photons travel during "
+                        "--animate, in cm/s (default %g, which crosses the "
+                        "%g cm track in %.1f s)"
+                        % (ANIM_SPEED, 2 * MUON_HALF_LEN,
+                           2 * MUON_HALF_LEN / ANIM_SPEED))
     p.add_argument("--size", type=int, nargs=2, default=[2850, 1500],
                    metavar=("W", "H"), help="window / image size")
     args = p.parse_args(argv)
@@ -1541,6 +1876,17 @@ def main(argv=None):
         print("           axis theta %g phi %g; spans theta %.1f-%.1f, "
               "phi %+.2f to %+.2f" % (TRIG_THETA, TRIG_PHI, TRIG_THETA - dt,
                                       TRIG_THETA + dt, -dp, dp))
+    if args.show_photons:
+        print("photons    %g per cm of track inside the scintillator, "
+              "isotropic, %g nm (%s)"
+              % (args.photons_per_cm, PHOTON_NM, photon_colour()))
+    if args.animate:
+        if args.html or args.screenshot:
+            print("animate    ignored: --screenshot and --html have no clock")
+        else:
+            print("animate    %g cm/s, so %g cm of track in %.1f s; "
+                  "'a' replays" % (args.speed, 2 * MUON_HALF_LEN,
+                                   2 * MUON_HALF_LEN / max(args.speed, 1e-9)))
     print("phi sense  muon %s phi  (--phi-sense %s)"
           % ("ARRIVES FROM" if args.phi_sense == "from" else "TRAVELS TO",
              args.phi_sense))
@@ -1562,7 +1908,10 @@ def main(argv=None):
                 halo=not args.no_halo, phi_sense=args.phi_sense,
                 compass=not args.no_compass, track_z0=args.track_z,
                 triggers=not args.no_triggers, trig_dist=args.trig_distance,
-                panels=not args.no_panels, savedir=args.savedir)
+                panels=not args.no_panels, savedir=args.savedir,
+                show_photons=args.show_photons,
+                photons_per_cm=args.photons_per_cm,
+                animate=args.animate, speed=args.speed)
 
     if off:
         d.i = 0                      # a still or a web page wants an event
