@@ -66,7 +66,8 @@ Trigger telescope
 Four 5 x 5 x 1 cm channels, the 1 cm axis radial about the track's axis
 crossing at z = TRACK_Z0, in two facing pairs on the accepted-muon direction
 theta = 50, phi = 0, 17 cm out from the pivot (--trig-distance).  Each is a
-tape-wrapped scintillator on a board of the same 5 x 5 footprint.
+scintillator slab on a board of the same 5 x 5 footprint; the slab is drawn in
+the cylinder's translucent blue, though the real one is wrapped in tape.
 
 At 17 cm the face spans theta 41.6 to 58.4 and phi -10.9 to +10.9.  A square
 face always subtends MORE in phi than in theta -- the phi lever arm is
@@ -183,8 +184,12 @@ TRIG_DIST = 17.0             # pivot to the centre of each pair
 TRIG_ADC_MAX = 1024.0        # Arduino analogRead full scale
 TRIG_HOT = 500.0             # HUD stars a channel above this
 
-CW_TAPE = "#141414"          # electrical tape over the scintillator
 CW_PCB = "#1d6b46"           # the CosmicWatch board
+# The trigger scintillator is drawn in the same pale blue as the cylinder
+# (SCINT, below).  The cylinder gets its look from two stacked shells, 0.17
+# over 0.10, so a single slab needs a touch more than 0.17 to sit at the same
+# apparent density.
+TRIG_SCINT_OPACITY = 0.26
 
 RING_HI, RING_LO = 15, 5     # the eleven rings that are read out
 NRING_DATA = RING_HI - RING_LO + 1
@@ -533,9 +538,14 @@ def _cw_frame(centre, w, outer):
 
 
 def cosmicwatch_body(centre, w, outer=True):
-    """The parts of a channel that never change: the taped scintillator and
-    the board behind it.  Static, so stepping through events does not rebuild
-    the telescope."""
+    """The parts of a channel that never change: the scintillator and the
+    board behind it.  Static, so stepping through events does not rebuild
+    the telescope.
+
+    The scintillator carries the same pale translucent blue as the cylinder,
+    so the two read as the same material; smooth shading stays off here so the
+    cube keeps its edges instead of rounding them off.
+    """
     M = _cw_frame(centre, w, outer)
     s = TRIG_SIZE
     parts = []
@@ -544,8 +554,8 @@ def cosmicwatch_body(centre, w, outer=True):
         parts.append((mesh.transform(M, inplace=False), style))
 
     add(pv.Cube(center=(0, 0, 0), x_length=TRIG_THICK, y_length=s, z_length=s),
-        color=CW_TAPE, smooth_shading=False, specular=0.55, specular_power=18,
-        ambient=0.22, diffuse=0.75)
+        color=SCINT, opacity=TRIG_SCINT_OPACITY, smooth_shading=False,
+        specular=1.0, specular_power=35, ambient=0.28, diffuse=0.75)
     add(pv.Cube(center=(0.5 * TRIG_THICK + 0.11, 0.0, 0.0),
                 x_length=0.22, y_length=s, z_length=s),
         color=CW_PCB, smooth_shading=True, specular=0.4, specular_power=22,
