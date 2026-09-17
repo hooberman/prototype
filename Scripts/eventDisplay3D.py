@@ -1583,16 +1583,15 @@ class Display:
                                             z0=self.track_z0,
                                             per_cm=self.photons_per_cm,
                                             seed=int(ev["trgid"]))
+        # Animated, the photons have no actor yet: it is made in the first
+        # frame that has light in it.  Drawing them at zero length instead
+        # would lay every emission point down at once, and the chord would
+        # show as a violet line through the cylinder before the muon arrived.
         ph_mesh = None
-        if photons is not None:
+        if photons is not None and not self.animate:
             starts, dirs, ranges, _ = photons
-            ph_mesh = photon_lines(starts, dirs,
-                                   np.zeros(len(starts)) if self.animate
-                                   else ranges)
-            self.dynamic.append(self.pl.add_mesh(
-                ph_mesh, color=photon_colour(), opacity=PHOTON_OPACITY,
-                line_width=PHOTON_WIDTH, lighting=False,
-                reset_camera=False, show_scalar_bar=False))
+            ph_mesh = photon_lines(starts, dirs, ranges)
+            self._add_photons(ph_mesh)
 
         track, head, bloom = muon_arc_meshes(entry_pt, u, arc0)
         entry = pv.Sphere(radius=0.28, center=entry_pt)
@@ -1621,6 +1620,13 @@ class Display:
         self.pl.render()
 
     # -- the flight ---------------------------------------------------------
+    def _add_photons(self, mesh):
+        """Put a photon mesh on screen, in the 420 nm line style."""
+        self.dynamic.append(self.pl.add_mesh(
+            mesh, color=photon_colour(), opacity=PHOTON_OPACITY,
+            line_width=PHOTON_WIDTH, lighting=False,
+            reset_camera=False, show_scalar_bar=False))
+
     def _anim_frame(self, step=0):
         """One frame of --animate: the track grows, the light follows it out.
 
@@ -1639,13 +1645,20 @@ class Display:
         a["head"].copy_from(head)
         a["bloom"].copy_from(bloom)
 
-        if a["ph_mesh"] is not None:
+        if a["photons"] is not None:
             starts, dirs, ranges, emitted_at = a["photons"]
             # The photons travel at the muon's own speed, so how far one has
             # got is simply how far the muon has come since emitting it --
             # negative for light not emitted yet, and clipped at the wall.
             grown = np.clip(arc - emitted_at, 0.0, ranges)
-            a["ph_mesh"].points = photon_lines(starts, dirs, grown).points
+            lit = grown > 0.0                    # the rest do not exist yet
+            if lit.any():
+                frame = photon_lines(starts[lit], dirs[lit], grown[lit])
+                if a["ph_mesh"] is None:
+                    a["ph_mesh"] = frame
+                    self._add_photons(frame)
+                else:
+                    a["ph_mesh"].copy_from(frame)
 
         if done:
             self._anim = None                    # leaves the finished track up
