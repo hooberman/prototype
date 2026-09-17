@@ -392,8 +392,13 @@ def read_hg(path, skip_events=1, max_events=None, column="HG"):
 # ----------------------------------------------------------------------------
 def make_plot(vals, out_paths, title, subtitle, lo, hi, nbins,
               logy=False, density=False, column="HG", cols=None,
-              per_panel_y=False, fits=None):
+              per_panel_y=True, fits=None):
     """One 4x4 grid.  cols selects which detector columns to overlay.
+
+    Each panel is scaled to its OWN highest bin by default.  Rows 0 and 1 carry
+    the pedestal peak, which is an order of magnitude taller than anything in
+    the photon comb, so one shared y axis flattens the other fourteen panels
+    into the baseline.  per_panel_y=False restores the shared axis.
 
     With `fits` -- {ch: fit dict} from fit_per_sipm -- each channel's own
     fitted comb is drawn over its histogram in the same colour, and its M goes
@@ -1398,6 +1403,105 @@ SEPT14_TRIG = {0: "TrigE", 1: "TrigF", 2: "TrigA", 3: "TrigC", 4: "TrigB",
                5: "TrigD"}
 
 
+# ---- did the fit actually find a comb? -------------------------------------
+# The failure this guards against: a falling background can approximate a whole
+# steeply falling spectrum on its own, so the minimiser is free to send every
+# peak amplitude to zero.  chi2 comes out fine, the curve looks smooth, and M
+# is left wherever the seed put it -- with a small error bar, because nothing
+# is pulling on it.  A fit whose comb carries almost none of the model is not a
+# measurement of M, and has to be caught by looking at the comb, not at chi2.
+MIN_COMB_FRAC = 0.04     # comb / total model, integrated over the fit range
+MIN_SIG_PEAKS = 2        # peaks needing amp > 3 sigma
+MAX_CHI2NDF = 5.0        # above this the fit is flagged, not rejected
+# A channel whose events nearly all sit BELOW the fit range has no photon
+# spectrum in the fitted window -- it is pedestal and little else.  The comb
+# will still find something to sit on, and with few entries the errors are big
+# enough that two peaks can clear 3 sigma on noise.
+MIN_FRAC_IN_RANGE = 0.30
+# M much further from the pooled value than any real gain spread.  Used only to
+# FLAG, never to correct: a genuine outlier channel should be seen, not hidden.
+GAIN_TOL = 0.40
+
+
+def assess_fit(fit, x, pooled_m=None, min_frac_in_range=MIN_FRAC_IN_RANGE,
+               gain_tol=GAIN_TOL):
+    """Add quality numbers and a verdict to a completed fit."""
+    if not fit or not fit.get("ok"):
+        return fit
+    p, k = fit["p"], fit["npeaks"]
+    ped, i0 = fit["ped"], fit.get("i0", 1)
+    comb = _peaks_only(x, p, k, ped, i0)
+    tot = peak_model(x, p, k, ped, i0)
+    s_tot = float(np.sum(np.abs(tot)))
+    fit["comb_frac"] = float(np.sum(comb) / s_tot) if s_tot > 0 else 0.0
+
+    sig = [float(fit["amp"][i] / fit["amp_err"][i])
+           if fit["amp_err"][i] > 0 else 0.0 for i in range(k)]
+    fit["amp_sig"] = sig
+    fit["n_sig_peaks"] = int(sum(1 for v in sig if v >= 3.0))
+    fit["chi2_ndf"] = (fit["chi2"] / fit["ndf"]) if fit["ndf"] else float("nan")
+
+    def _at(v, edge):
+        return abs(v - edge) < 1e-3 * max(1.0, abs(edge))
+    fit["gain_at_bound"] = bool(_at(fit["gain"], fit["n_lo"])
+                                or _at(fit["gain"], fit["n_hi"]))
+    fit["ped_at_bound"] = bool(fit.get("ped_fitted")
+                               and (_at(fit["ped"], fit["ped_lo"])
+                                    or _at(fit["ped"], fit["ped_hi"])))
+
+    if fit.get("frac_in_range", 1.0) < min_frac_in_range:
+        fit["verdict"] = ("only %.0f%% of this channel's events reach the fit "
+                          "range: no photon spectrum to fit"
+                          % (100.0 * fit.get("frac_in_range", 0.0)))
+    elif fit["comb_frac"] < MIN_COMB_FRAC:
+        fit["verdict"] = ("degenerate: the comb carries only %.1f%% of the "
+                          "model, the background absorbed the peaks"
+                          % (100.0 * fit["comb_frac"]))
+    elif fit["n_sig_peaks"] < MIN_SIG_PEAKS:
+        fit["verdict"] = ("only %d of %d peaks are above 3 sigma"
+                          % (fit["n_sig_peaks"], k))
+    elif fit["gain_at_bound"]:
+        fit["verdict"] = "M is sitting on its bound (%.3g, %.3g)" % (
+            fit["n_lo"], fit["n_hi"])
+    elif fit["ped_at_bound"]:
+        fit["verdict"] = "P is sitting on its bound"
+    elif (pooled_m and gain_tol > 0
+          and abs(fit["gain"] - pooled_m) > gain_tol * pooled_m):
+        fit["verdict"] = ("M is %.0f%% away from the pooled %.2f"
+                          % (100.0 * abs(fit["gain"] - pooled_m) / pooled_m,
+                             pooled_m))
+    elif fit["chi2_ndf"] > MAX_CHI2NDF:
+        fit["verdict"] = "high chi2/ndf = %.1f" % fit["chi2_ndf"]
+    else:
+        fit["verdict"] = "ok"
+    return fit
+
+
+def rank_key(fit):
+    """Sort key: usable fits first, then by chi2; unusable by how much comb
+    they managed to find at all."""
+    if not fit or not fit.get("ok"):
+        return (4, 0.0)
+    v = fit.get("verdict", "")
+    if v == "ok":
+        return (0, fit["chi2_ndf"])
+    if v.startswith("high chi2"):
+        return (1, fit["chi2_ndf"])
+    if v.startswith("only "):
+        return (2, -fit.get("comb_frac", 0.0))
+    return (3, -fit.get("comb_frac", 0.0))
+
+
+def local_maxima(y, smooth=3):
+    """How many bumps the spectrum has -- 0 means there is nothing to fit."""
+    y = np.asarray(y, dtype=float)
+    if y.size < 2 * smooth + 3:
+        return 0
+    ker = np.ones(smooth) / float(smooth)
+    z = np.convolve(y, ker, mode="same")
+    return int(np.sum((z[1:-1] > z[:-2]) & (z[1:-1] >= z[2:])))
+
+
 def sipm_cell(ch):
     """ch -> (column letter, ring) under the Sept 14 assignment, or None."""
     if 6 <= ch < 32:
@@ -1410,53 +1514,148 @@ def sipm_cell(ch):
 SIPM_CH = [ch for ch in range(NCH) if sipm_cell(ch) is not None]
 
 
-def fit_one_channel(x, edges, centres, fit_lo, fit_hi, **kw):
-    """Fit one channel's own spectrum.  Same model as the pooled fit."""
-    if x.size == 0:
-        return {"ok": False, "why": "no entries"}
+def _fit_once(x, edges, centres, fit_lo, fit_hi, pooled_m=None,
+              min_frac_in_range=MIN_FRAC_IN_RANGE, gain_tol=GAIN_TOL, **kw):
+    """One attempt at one channel.  Returns a fit dict, assessed."""
     h, _ = np.histogram(x, bins=edges)
     err = np.sqrt(np.maximum(h, 1.0))
     sel = (centres >= fit_lo) & (centres <= fit_hi)
     npar = 2 * kw.get("npeaks", NPEAKS) + 6
     if sel.sum() < npar:
-        return {"ok": False, "why": "only %d bins in the fit range"
-                                    % int(sel.sum())}
+        return {"ok": False, "why": "only %d bins in %g-%g, need %d"
+                                    % (int(sel.sum()), fit_lo, fit_hi, npar)}
     if h[sel].sum() < 20:
-        return {"ok": False, "why": "only %d entries in the fit range"
-                                    % int(h[sel].sum())}
+        return {"ok": False, "why": "only %d entries in %g-%g"
+                                    % (int(h[sel].sum()), fit_lo, fit_hi)}
     fit = fit_photon_peaks(centres[sel], h[sel].astype(float), err[sel], **kw)
     if fit.get("ok"):
         fit["fit_lo"], fit["fit_hi"] = float(fit_lo), float(fit_hi)
         fit["nentries"] = int(h[sel].sum())
+        fit["frac_in_range"] = (float(h[sel].sum()) / float(x.size)
+                                if x.size else 0.0)
+        fit["n_local_max"] = local_maxima(h[sel])
+        assess_fit(fit, centres[sel], pooled_m=pooled_m,
+                   min_frac_in_range=min_frac_in_range, gain_tol=gain_tol)
     return fit
 
 
+def _strategies(base_kw, pooled_m, fit_lo):
+    """The ladder, cheapest and most likely first.
+
+    Each entry is (name, fit_lo override or None, kwargs override).  The order
+    matters: the first attempt that comes back 'ok' is taken and the rest are
+    not run, so the common case costs exactly one fit.
+    """
+    npk = base_kw.get("npeaks", NPEAKS)
+    out = []
+    if pooled_m:
+        out.append(("seeded at pooled M", None,
+                    dict(n_init=float(pooled_m), nscan=0)))
+    out.append(("scan for M", None, dict(n_init=None, nscan=NSCAN)))
+    # With no background the comb has to carry the spectrum, which is the
+    # direct cure for the degenerate case: the background cannot absorb the
+    # peaks if there is no background.
+    out.append(("comb only, no background", None,
+                dict(bkg_mode=BKG_NONE, n_init=None, nscan=NSCAN)))
+    if npk > 2:
+        out.append(("one fewer peak", None,
+                    dict(npeaks=npk - 1, n_init=None, nscan=NSCAN)))
+    # Starting higher drops the steep pedestal tail, which is what the
+    # quadratic is usually chasing when it swallows the comb.
+    out.append(("start at %g ADC" % (fit_lo * 1.8), fit_lo * 1.8,
+                dict(n_init=None, nscan=NSCAN)))
+    return out
+
+
+def _attempt_line(name, fit):
+    """One line of the log for one attempt."""
+    if not fit.get("ok"):
+        return "    %-26s FAILED   %s" % (name, fit.get("why", "unknown"))
+    return ("    %-26s M=%7.3f +-%6.3f  P=%7.2f  chi2/ndf=%7.2f  "
+            "comb=%5.1f%%  sig=%d/%d  inRange=%4.0f%%   -> %s"
+            % (name, fit["gain"], fit["gain_err"], fit["ped"],
+               fit["chi2_ndf"], 100.0 * fit["comb_frac"],
+               fit["n_sig_peaks"], fit["npeaks"],
+               100.0 * fit.get("frac_in_range", 0.0), fit["verdict"]))
+
+
+def fit_one_channel(x, edges, centres, fit_lo, fit_hi, pooled_m=None,
+                    log=None, tag="", min_frac_in_range=MIN_FRAC_IN_RANGE,
+                    gain_tol=GAIN_TOL, **kw):
+    """Fit one channel, retrying down the ladder until something holds up."""
+    if x.size == 0:
+        if log is not None:
+            log.append("%s  no entries" % tag)
+        return {"ok": False, "why": "no entries"}
+
+    attempts = []
+    lines = []
+    for name, lo_over, over in _strategies(kw, pooled_m, fit_lo):
+        flo = fit_lo if lo_over is None else lo_over
+        kk = dict(kw)
+        kk.update(over)
+        fit = _fit_once(x, edges, centres, flo, fit_hi,
+                        pooled_m=pooled_m, min_frac_in_range=min_frac_in_range,
+                        gain_tol=gain_tol, **kk)
+        fit["strategy"] = name
+        attempts.append(fit)
+        lines.append(_attempt_line(name, fit))
+        if fit.get("ok") and fit.get("verdict") == "ok":
+            break
+
+    best = min(attempts, key=rank_key)
+    best["n_attempts"] = len(attempts)
+    if log is not None:
+        h, _ = np.histogram(x, bins=edges)
+        sel = (centres >= fit_lo) & (centres <= fit_hi)
+        log.append("%s   %d entries total, %d in %g-%g, %d bumps in range"
+                   % (tag, int(x.size), int(h[sel].sum()), fit_lo, fit_hi,
+                      local_maxima(h[sel])))
+        log.extend(lines)
+        if best.get("ok"):
+            log.append("    CHOSEN: %s  ->  M = %.3f +- %.3f   [%s]"
+                       % (best["strategy"], best["gain"], best["gain_err"],
+                          best["verdict"]))
+        else:
+            log.append("    CHOSEN: none converged")
+        log.append("")
+    return best
+
+
 def fit_per_sipm(vals, lo, hi, nbins, fit_lo, fit_hi, seed_gain_value=None,
-                 verbose=True, **kw):
+                 verbose=True, log=None, min_frac_in_range=MIN_FRAC_IN_RANGE,
+                 gain_tol=GAIN_TOL, **kw):
     """Fit every SiPM channel separately.  Returns {ch: fit dict}.
 
-    Seeding: with a pooled M in hand every channel starts from it, which is
+    Seeding: with a pooled M in hand every channel tries it first, which is
     both far faster (no scan) and far safer -- a single channel has ~1/50 of
-    the pooled statistics, and an unseeded comb on thin statistics is exactly
-    where M lands on a sub-multiple.
+    the pooled statistics.  If that attempt does not hold up, the ladder in
+    _strategies takes over.
     """
     edges = np.linspace(lo, hi, nbins + 1)
     centres = 0.5 * (edges[:-1] + edges[1:])
-    if seed_gain_value is not None:
-        kw = dict(kw, n_init=float(seed_gain_value), nscan=0)
 
     fits = {}
-    nok = 0
+    nok = nretry = 0
     for ch in SIPM_CH:
+        col, ring = sipm_cell(ch)
+        tag = "ch%-3d %-4s" % (ch, "%s%d" % (col, ring))
         fits[ch] = fit_one_channel(vals[ch], edges, centres, fit_lo, fit_hi,
-                                   **kw)
+                                   pooled_m=seed_gain_value, log=log, tag=tag,
+                                   min_frac_in_range=min_frac_in_range,
+                                   gain_tol=gain_tol, **kw)
         if fits[ch].get("ok"):
             nok += 1
+            if fits[ch].get("n_attempts", 1) > 1:
+                nretry += 1
     if verbose:
-        print("per-SiPM   %d of %d channels fitted%s"
-              % (nok, len(SIPM_CH),
-                 "" if seed_gain_value is None
-                 else "  (seeded at the pooled M = %.2f)" % seed_gain_value))
+        ngood = sum(1 for f in fits.values()
+                    if f.get("ok") and f.get("verdict") == "ok")
+        print("per-SiPM   %d of %d channels converged, %d clean, %d needed a "
+              "retry%s" % (nok, len(SIPM_CH), ngood, nretry,
+                           "" if seed_gain_value is None
+                           else "  (first try: pooled M = %.2f)"
+                                % seed_gain_value))
     return fits
 
 
@@ -1470,7 +1669,9 @@ def gain_grid(fits):
     e = np.full((NRING_ALL, len(COLS)), np.nan)
     for ch, fit in fits.items():
         cell = sipm_cell(ch)
-        if cell is None or not fit.get("ok"):
+        # a SUSPECT fit is not a measurement of M, so it is not given a colour
+        if cell is None or not fit.get("ok") \
+                or fit.get("verdict", "ok") != "ok":
             continue
         col, ring = cell
         if 0 <= ring < NRING_ALL:
@@ -1480,10 +1681,12 @@ def gain_grid(fits):
 
 
 HAS_CH = np.zeros((NRING_ALL, len(COLS)), dtype=bool)
+ACTIVE_CELL = np.zeros((NRING_ALL, len(COLS)), dtype=bool)
 for _ch in SIPM_CH:
     _col, _ring = sipm_cell(_ch)
     if 0 <= _ring < NRING_ALL:
         HAS_CH[RING_ALL_HI - _ring][COLS.index(_col)] = True
+        ACTIVE_CELL[RING_ALL_HI - _ring][COLS.index(_col)] = is_active(_ch)
 
 
 def make_gain_map(fits, out_paths, title, subtitle, column="HG",
@@ -1495,6 +1698,19 @@ def make_gain_map(fits, out_paths, title, subtitle, column="HG",
     that in the middle of the colour bar.
     """
     m, e = gain_grid(fits)
+    # why a cell has no number: never converged, or converged but not trusted
+    why = {}
+    for ch, fit in fits.items():
+        cell = sipm_cell(ch)
+        if cell is None:
+            continue
+        col, ring = cell
+        if 0 <= ring < NRING_ALL:
+            key = (RING_ALL_HI - ring, COLS.index(col))
+            if not fit.get("ok"):
+                why[key] = "no fit"
+            elif fit.get("verdict", "ok") != "ok":
+                why[key] = "suspect"
     good = np.isfinite(m)
     if not good.any():
         print("  no gain map: no channel fitted successfully")
@@ -1509,7 +1725,7 @@ def make_gain_map(fits, out_paths, title, subtitle, column="HG",
 
     fig = plt.figure(figsize=(7.6, 11.0))
     gs = fig.add_gridspec(1, 2, width_ratios=[4.4, 0.2], wspace=0.06,
-                          left=0.115, right=0.855, top=0.812, bottom=0.05)
+                          left=0.115, right=0.855, top=0.795, bottom=0.05)
     ax = fig.add_subplot(gs[0, 0])
     ax_cb = fig.add_subplot(gs[0, 1])
 
@@ -1530,8 +1746,11 @@ def make_gain_map(fits, out_paths, title, subtitle, column="HG",
                                            facecolor="#f2f2f2",
                                            edgecolor="#cc3311", hatch="//",
                                            lw=1.0, zorder=2))
-                ax.text(c + 0.5, y, "no fit", ha="center", va="center",
-                        fontsize=7.5, color="#cc3311", zorder=3)
+                ax.text(c + 0.5, y, why.get((r, c), "no fit"), ha="center",
+                        va="center", fontsize=7.5, color="#cc3311", zorder=3,
+                        bbox=dict(boxstyle="round,pad=0.15",
+                                  facecolor="white", edgecolor="none",
+                                  alpha=0.85))
                 continue
             rgba = cmap(norm(m[r][c]))
             lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
@@ -1539,6 +1758,14 @@ def make_gain_map(fits, out_paths, title, subtitle, column="HG",
                     ha="center", va="center", fontsize=7.5,
                     linespacing=1.15,
                     color="black" if lum > 0.55 else "white")
+            # A cell outside the active 50 still gets a fit and still gets a
+            # colour, and on rows 0-2 that fit is meaningless -- those channels
+            # see almost no light, so the comb has nothing to lock onto.  Mark
+            # them, or a confident-looking number gets read as a measurement.
+            if not ACTIVE_CELL[r][c]:
+                ax.add_patch(plt.Rectangle((c, NRING_ALL - r - 1), 1, 1,
+                                           fill=False, edgecolor="0.25",
+                                           ls="--", lw=1.4, zorder=4))
 
     ax.set_xticks([c + 0.5 for c in range(len(COLS))])
     ax.set_xticklabels(COLS, fontsize=11)
@@ -1565,8 +1792,11 @@ def make_gain_map(fits, out_paths, title, subtitle, column="HG",
                 int(good.sum()))]
     if pooled is not None:
         lines.append("pooled all-50 fit gave M = %.2f" % pooled)
-    lines.append("grey = no channel assigned (A0-A2, C0-C2);  "
-                 "hatched = channel present, fit did not converge")
+    lines.append("grey = no channel assigned (A0-A2, C0-C2);  hatched = "
+                 "channel present but no trustworthy fit (see the log)")
+    lines.append("dashed outline = outside the active %d (rows 0-2, C4, C12): "
+                 "fitted, but those channels see almost no light"
+                 % len(ACTIVE_CH))
     fig.text(0.5, 0.932, "\n".join(lines), ha="center", va="top",
              fontsize=8.5, color="0.25", linespacing=1.5)
 
@@ -1578,33 +1808,42 @@ def make_gain_map(fits, out_paths, title, subtitle, column="HG",
 
 def per_sipm_lines(fits, pooled=None):
     """The per-channel table, as text."""
-    out = ["%-5s %-6s %-9s %10s %10s %10s %9s"
-           % ("ch", "cell", "status", "M", "err", "P", "chi2/ndf")]
+    out = ["%-5s %-6s %-9s %10s %10s %10s %9s %7s %5s  %-24s %s"
+           % ("ch", "cell", "status", "M", "err", "P", "chi2/ndf", "comb%",
+              "sig", "strategy", "verdict")]
     ms = []
     for ch in SIPM_CH:
         col, ring = sipm_cell(ch)
         fit = fits.get(ch) or {}
         if not fit.get("ok"):
-            out.append("%-5d %-6s %-9s %10s %10s %10s %9s   %s"
+            out.append("%-5d %-6s %-9s %10s %10s %10s %9s %7s %5s  %-24s %s"
                        % (ch, "%s%d" % (col, ring), "FAILED", "-", "-", "-",
-                          "-", fit.get("why", "unknown")))
+                          "-", "-", "-", "-", fit.get("why", "unknown")))
             continue
-        ms.append(fit["gain"])
-        red = fit["chi2"] / fit["ndf"] if fit["ndf"] else float("nan")
-        out.append("%-5d %-6s %-9s %10.3f %10.3f %10.3f %9.2f"
-                   % (ch, "%s%d" % (col, ring), "ok", fit["gain"],
-                      fit["gain_err"], fit["ped"], red))
+        clean = fit.get("verdict") == "ok"
+        if clean:
+            ms.append(fit["gain"])
+        out.append("%-5d %-6s %-9s %10.3f %10.3f %10.3f %9.2f %6.1f%% %2d/%-2d"
+                   "  %-24s %s"
+                   % (ch, "%s%d" % (col, ring), "ok" if clean else "SUSPECT",
+                      fit["gain"], fit["gain_err"], fit["ped"],
+                      fit.get("chi2_ndf", float("nan")),
+                      100.0 * fit.get("comb_frac", 0.0),
+                      fit.get("n_sig_peaks", 0), fit["npeaks"],
+                      fit.get("strategy", "?"), fit.get("verdict", "?")))
     out.append("")
     if ms:
         a = np.asarray(ms)
-        out.append("fitted %d of %d SiPMs" % (a.size, len(SIPM_CH)))
+        out.append("clean fits: %d of %d SiPMs  (SUSPECT rows are excluded "
+                   "from the numbers below and from the map's median)"
+                   % (a.size, len(SIPM_CH)))
         out.append("M   mean %.3f   median %.3f   std %.3f   min %.3f   "
                    "max %.3f" % (a.mean(), np.median(a), a.std(), a.min(),
                                  a.max()))
         if pooled is not None:
             out.append("pooled all-50 fit: M = %.3f" % pooled)
     else:
-        out.append("no channel was fitted successfully")
+        out.append("no channel produced a clean fit")
     return out
 
 
@@ -1634,10 +1873,15 @@ def main(argv=None):
                    help="number of bins (default %d)" % NBINS)
     p.add_argument("--logy", action="store_true",
                    help="logarithmic y axis")
+    p.add_argument("--shared-y", action="store_true",
+                   help="give every panel of the 4x4 grid the same y axis, set "
+                        "by the highest bin in the whole figure.  The default "
+                        "is one axis per panel: rows 0 and 1 hold the pedestal "
+                        "peak, which is far taller than any photon peak and "
+                        "flattens every other panel when the axis is shared")
     p.add_argument("--per-panel-y", action="store_true",
-                   help="scale every panel of the grid to its own highest "
-                        "bin instead of sharing one y axis set by the highest "
-                        "bin in the figure")
+                   help="accepted and ignored: this is now the default.  Use "
+                        "--shared-y for the old behaviour")
     p.add_argument("--density", action="store_true",
                    help="normalise each channel to unit area instead of "
                         "plotting raw counts")
@@ -1730,6 +1974,18 @@ def main(argv=None):
                    help="peaks in the per-channel fits (default: --npeaks).  A "
                         "single channel has ~1/50 of the pooled statistics, so "
                         "fewer peaks is often the steadier choice")
+    p.add_argument("--min-frac-in-range", type=float,
+                   default=MIN_FRAC_IN_RANGE, metavar="F",
+                   help="a channel with less than this fraction of its events "
+                        "inside the fit range is called SUSPECT (default %g): "
+                        "it is pedestal, with no photon spectrum to fit"
+                        % MIN_FRAC_IN_RANGE)
+    p.add_argument("--gain-tolerance", type=float, default=GAIN_TOL,
+                   metavar="F",
+                   help="flag a channel whose M is further than this fraction "
+                        "from the pooled M (default %g; 0 disables).  It only "
+                        "flags -- a real outlier channel should be visible, "
+                        "not corrected" % GAIN_TOL)
     p.add_argument("--per-sipm-no-seed", action="store_true",
                    help="do not seed the per-channel fits at the pooled M.  By "
                         "default the all-50 fit's M seeds every channel, which "
@@ -1885,6 +2141,39 @@ def main(argv=None):
         ngauss = npk + 1 if args.ped_peak else npk
         i0 = 0 if args.ped_peak else 1
         t0 = time.time()
+        fit_log = []
+        fit_log.append("=" * 78)
+        fit_log.append("per-SiPM fit log")
+        fit_log.append("=" * 78)
+        fit_log.append("file      %s" % os.path.abspath(args.listfile))
+        fit_log.append("runs      %s"
+                       % (", ".join(runs) if runs else "(none parsed)"))
+        fit_log.append("events    %d used of %d seen (first %d skipped)"
+                       % (nused, nseen, args.skip_events))
+        fit_log.append("column    %s,  histogram %g-%g in %d bins"
+                       % (args.column, args.xmin, args.xmax, args.nbins))
+        fit_log.append("fit range %g to %g ADC"
+                       % (args.fit_xmin,
+                          args.fit_xmax if args.fit_xmax else args.xmax))
+        fit_log.append("peaks     %d per channel, background: %s"
+                       % (args.per_sipm_npeaks or args.npeaks,
+                          BKG_LABEL.get(bkg_mode, "?")))
+        fit_log.append("pooled M  %s"
+                       % ("%.4f" % all50_fit["gain"]
+                          if all50_fit and all50_fit.get("ok") else "none"))
+        fit_log.append("")
+        fit_log.append("A fit is called SUSPECT unless the comb carries at "
+                       "least %.0f%% of the model over" % (100 * MIN_COMB_FRAC))
+        fit_log.append("the fit range, at least %d peaks are above 3 sigma, "
+                       "and M is off its bounds." % MIN_SIG_PEAKS)
+        fit_log.append("A falling background can fit a falling spectrum on "
+                       "its own, sending every peak")
+        fit_log.append("amplitude to zero -- chi2 looks fine and M is left "
+                       "wherever the seed put it.")
+        fit_log.append("comb%% is what catches that.  Strategies are tried in "
+                       "order until one is clean.")
+        fit_log.append("=" * 78)
+        fit_log.append("")
         per_fits = fit_per_sipm(
             vals, args.xmin, args.xmax, args.nbins,
             args.fit_xmin, args.fit_xmax if args.fit_xmax else args.xmax,
@@ -1895,7 +2184,9 @@ def main(argv=None):
             n_lo=args.n_min, n_hi=args.n_max, bkg_mode=bkg_mode,
             sig_frac_lo=args.sigma_min_frac, sig_frac_hi=args.sigma_max_frac,
             i0=i0, ped_init=args.ped_init, ped_lo=args.ped_min,
-            ped_hi=args.ped_max, fix_ped=args.fix_ped)
+            ped_hi=args.ped_max, fix_ped=args.fix_ped, log=fit_log,
+            min_frac_in_range=args.min_frac_in_range,
+            gain_tol=args.gain_tolerance)
         print("           %.1f s" % (time.time() - t0))
 
     # ---- the combined A-D plot, then one plot per detector column ----
@@ -1904,13 +2195,13 @@ def main(argv=None):
         top = make_plot(vals, paths, title, sub, args.xmin, args.xmax,
                         args.nbins, logy=args.logy, density=args.density,
                         column=args.column, cols=cols,
-                        per_panel_y=args.per_panel_y, fits=per_fits)
+                        per_panel_y=not args.shared_y, fits=per_fits)
         if not args.density and not args.logy:
-            print("y axis     %s: highest bin %.0f -> top %.0f"
-                  % (os.path.basename(png), top, YHEADROOM * top)
-                  if not args.per_panel_y else
-                  "y axis     %s: each panel scaled to its own highest bin"
-                  % os.path.basename(png))
+            print("y axis     %s: %s"
+                  % (os.path.basename(png),
+                     "highest bin %.0f -> top %.0f" % (top, YHEADROOM * top)
+                     if args.shared_y
+                     else "each panel scaled to its own highest bin"))
         written += paths
     written += all50_paths
 
@@ -1924,6 +2215,39 @@ def main(argv=None):
             "%s   %s ADC counts per photoelectron, per SiPM"
             % (label, args.column),
             base + stamp, column=args.column, pooled=pooled_m)
+
+        # ---- the diagnostic log ----
+        nsus = sum(1 for f in per_fits.values()
+                   if f.get("ok") and f.get("verdict") != "ok")
+        nbad = sum(1 for f in per_fits.values() if not f.get("ok"))
+        fit_log.append("=" * 78)
+        fit_log.append("summary")
+        fit_log.append("=" * 78)
+        for ch in SIPM_CH:
+            f = per_fits[ch]
+            col, ring = sipm_cell(ch)
+            if not f.get("ok"):
+                fit_log.append("  ch%-3d %-4s  NO FIT    %s"
+                               % (ch, "%s%d" % (col, ring),
+                                  f.get("why", "unknown")))
+            elif f.get("verdict") != "ok":
+                fit_log.append("  ch%-3d %-4s  SUSPECT   M=%.3f after %d "
+                               "attempt(s): %s"
+                               % (ch, "%s%d" % (col, ring), f["gain"],
+                                  f.get("n_attempts", 1), f["verdict"]))
+        fit_log.append("")
+        fit_log.append("  %d channels clean, %d suspect, %d did not converge"
+                       % (len(SIPM_CH) - nsus - nbad, nsus, nbad))
+        fit_log.append("=" * 78)
+        if not args.no_txt:
+            logtxt = "%s_fitLog.txt" % stem
+            with open(logtxt, "w") as f:
+                f.write("\n".join(fit_log))
+                f.write("\n")
+            written.append(logtxt)
+        if nsus or nbad:
+            print("           %d suspect, %d failed -- see %s_fitLog.txt"
+                  % (nsus, nbad, os.path.basename(stem)))
 
         table = per_sipm_lines(per_fits, pooled_m)
         print("-" * 78)
