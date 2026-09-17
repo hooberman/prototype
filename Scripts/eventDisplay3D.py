@@ -67,7 +67,11 @@ Four 5 x 5 x 1 cm channels, the 1 cm axis radial about the track's axis
 crossing at z = TRACK_Z0, in two facing pairs on the accepted-muon direction
 theta = 50, phi = 0, 17 cm out from the pivot (--trig-distance).  Each is a
 scintillator slab on a board of the same 5 x 5 footprint; the slab is drawn in
-the cylinder's translucent blue, though the real one is wrapped in tape.
+the cylinder's translucent blue, though the real one is wrapped in tape.  A
+SiPM sits at the centre of each board, drawn like the ones on the cylinder
+boards.  It carries no read-out value, so it is simply dark on the setup view
+and lit at the top of the colour ramp -- the shade the brightest SiPM on the
+cylinder is wearing -- whenever an event is loaded.
 
 At 17 cm the face spans theta 41.6 to 58.4 and phi -10.9 to +10.9.  A square
 face always subtends MORE in phi than in theta -- the phi lever arm is
@@ -185,11 +189,15 @@ TRIG_ADC_MAX = 1024.0        # Arduino analogRead full scale
 TRIG_HOT = 500.0             # HUD stars a channel above this
 
 CW_PCB = "#1d6b46"           # the CosmicWatch board
+CW_PCB_X = 0.5 * TRIG_THICK + 0.11   # board centre, along the channel's own +x
 # The trigger scintillator is drawn in the same pale blue as the cylinder
 # (SCINT, below).  The cylinder gets its look from two stacked shells, 0.17
 # over 0.10, so a single slab needs a touch more than 0.17 to sit at the same
 # apparent density.
 TRIG_SCINT_OPACITY = 0.26
+# The trigger SiPM lights at full scale, so its bloom is the size build_halo
+# gives a tile at the event maximum: 1.0 + 2.1.
+TRIG_HALO_SCALE = 3.1
 
 RING_HI, RING_LO = 15, 5     # the eleven rings that are read out
 NRING_DATA = RING_HI - RING_LO + 1
@@ -556,11 +564,50 @@ def cosmicwatch_body(centre, w, outer=True):
     add(pv.Cube(center=(0, 0, 0), x_length=TRIG_THICK, y_length=s, z_length=s),
         color=SCINT, opacity=TRIG_SCINT_OPACITY, smooth_shading=False,
         specular=1.0, specular_power=35, ambient=0.28, diffuse=0.75)
-    add(pv.Cube(center=(0.5 * TRIG_THICK + 0.11, 0.0, 0.0),
+    add(pv.Cube(center=(CW_PCB_X, 0.0, 0.0),
                 x_length=0.22, y_length=s, z_length=s),
         color=CW_PCB, smooth_shading=True, specular=0.4, specular_power=22,
         ambient=0.22)
     return parts
+
+
+def trig_sipms(placements, scale=1.0, thick=SIPM_DRAW_THICK):
+    """The four trigger SiPMs as ONE mesh, one per CosmicWatch board.
+
+    Same 6 mm square as the tiles on the cylinder boards and centred on the
+    board the same way, so it stands proud of both faces and reads from either
+    side.  Merged into a single mesh for the same reason build_sipms is: one
+    actor to add and drop per event instead of four.
+
+    `scale` and `thick` are what build_halo does to a tile, so the same call
+    also makes the bloom box.
+    """
+    blocks = []
+    for centre, w, outer in placements:
+        M = _cw_frame(centre, w, outer)
+        tile = pv.Cube(center=(CW_PCB_X, 0.0, 0.0), x_length=thick,
+                       y_length=SIPM_SIZE * scale, z_length=SIPM_SIZE * scale)
+        blocks.append(tile.transform(M, inplace=False))
+    return pv.MultiBlock(blocks).combine() if blocks else None
+
+
+def cmap_top_colour(cmap):
+    """The colour the brightest SiPM on the cylinder comes out, as hex.
+
+    cmap is the GLOW ramp by default but a matplotlib name when --cmap is
+    given, and the lookup for a name moved between matplotlib versions, so
+    both spellings are tried.
+    """
+    from matplotlib.colors import to_hex
+    m = cmap
+    if not callable(m):
+        try:
+            import matplotlib
+            m = matplotlib.colormaps[m]
+        except Exception:
+            from matplotlib import cm
+            m = cm.get_cmap(m)
+    return to_hex(m(1.0))
 
 
 def compass_meshes():
@@ -1241,6 +1288,27 @@ class Display:
                     opacity=0.22, show_scalar_bar=False, ambient=1.0,
                     diffuse=0.0, specular=0.0))
 
+        # The trigger SiPMs are not read out, so there is no count to map:
+        # they simply come up at the top of the ramp, the colour the brightest
+        # tile on the cylinder is wearing, with the tiles' own lighting so the
+        # two match under every light in the rig.
+        if self.triggers:
+            lit = cmap_top_colour(self.cmap)
+            places = self.trig_placements()
+            m = trig_sipms(places)
+            if m is not None:
+                self.dynamic.append(self.pl.add_mesh(
+                    m, color=lit, reset_camera=False, smooth_shading=False,
+                    specular=0.55, specular_power=25, ambient=0.30,
+                    diffuse=0.85, show_scalar_bar=False))
+                if self.halo:
+                    self.dynamic.append(self.pl.add_mesh(
+                        trig_sipms(places, scale=TRIG_HALO_SCALE,
+                                   thick=SIPM_DRAW_THICK * 1.15),
+                        color=lit, opacity=0.22, reset_camera=False,
+                        ambient=1.0, diffuse=0.0, specular=0.0,
+                        show_scalar_bar=False))
+
         if self.compass:
             shaft, tip, _, _ = phi_pointer(ev["phi"])
             for m in (shaft, tip):
@@ -1283,6 +1351,12 @@ class Display:
         self.dynamic.append(self.pl.add_mesh(
             dark, color=DEAD, reset_camera=False, smooth_shading=True,
             specular=0.3, ambient=0.25, show_scalar_bar=False))
+        if self.triggers:
+            m = trig_sipms(self.trig_placements())
+            if m is not None:
+                self.dynamic.append(self.pl.add_mesh(
+                    m, color=DEAD, reset_camera=False, smooth_shading=True,
+                    specular=0.3, ambient=0.25, show_scalar_bar=False))
 
 
         self.dynamic.append(self.add_hud(
