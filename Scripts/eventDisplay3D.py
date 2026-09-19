@@ -130,8 +130,9 @@ Scintillation photons
 ---------------------
 --showPhotons draws the light.  Photons are emitted at random points along the
 chord the muon cuts through the cylinder, at --nPhotonsPerCM per cm (default
-100), isotropically, and each line stops where it meets the wall or an end cap.
-They are drawn at 420 nm, the emission peak of the plastic.
+500), isotropically, and each line stops where it meets the wall or an end cap.
+They are drawn at 420 nm, the emission peak of the plastic, faint enough that
+the detector still shows through several thousand of them.
 
 This is a picture of an isotropic emitter, not a light-collection simulation:
 the lines are straight, and there is no refraction at the wall, no reflection,
@@ -197,16 +198,20 @@ R_SIPM = R_PCB                                # drawn centred on the board
 
 # ---- scintillation photons (--showPhotons) ---------------------------------
 PHOTON_NM = 420.0            # emission peak of the plastic, in nanometres
-PHOTONS_PER_CM = 100.0       # lines per cm of track inside the scintillator
-PHOTON_OPACITY = 0.30        # a thousand opaque lines is a solid ball of light
+PHOTONS_PER_CM = 500.0       # lines per cm of track inside the scintillator
+# Per-line alpha.  It goes down as the default density goes up: five thousand
+# lines through one cylinder stack into an opaque violet wall unless each one
+# is faint, and the point of drawing them is to see the detector behind them.
+PHOTON_OPACITY = 0.08
 # VTK quantises line width to quarter-pixel steps -- 1.0, 1.25, 1.5 ... render
-# distinguishably, anything between them does not -- so this is one step up
-# from a hairline, the smallest increase that actually reaches the screen.
-PHOTON_WIDTH = 1.25
-# A hard ceiling on the lines drawn.  A near-vertical track cuts a 30 cm chord,
-# which at a few hundred per cm would stall the interaction, so past this the
-# same chord is shown with fewer photons rather than slowly.
-PHOTON_MAX = 6000
+# distinguishably, anything between them does not -- so this is two steps up
+# from a hairline.
+PHOTON_WIDTH = 1.5
+# A hard ceiling on the lines drawn.  A near-vertical track cuts the full 30 cm
+# of the cylinder, which at the default density is 15000 photons -- so that
+# case just fits, and a higher --nPhotonsPerCM is shown with fewer photons
+# rather than at a frame rate that makes the animation crawl.
+PHOTON_MAX = 15000
 
 # ---- the drawn muon, and the animation of it (--animate) -------------------
 MUON_HALF_LEN = 23.0         # the track is drawn this far either side of z0
