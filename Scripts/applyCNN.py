@@ -878,7 +878,10 @@ def main(argv=None):
     perf = cfg.get("performance_on_test_set", {})
 
     stem = src[:-4] if src.lower().endswith(".txt") else src
-    out_base = "%s_%s_CNN" % (stem, label)
+    # the theta-max actually used: the same rounding make_page applies
+    tmax_eff = args.theta_max if args.theta_max else THETA_MAX_DEG
+    tmax_eff = args.radio_dtheta * np.ceil(tmax_eff / args.radio_dtheta)
+    out_base = "%s_%s_theta%g_CNN" % (stem, label, tmax_eff)
     out_txt = args.out or (out_base + ".txt")
     out_png = out_base + ".png"
     out_pdf = out_base + ".pdf"
