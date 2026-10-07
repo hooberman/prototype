@@ -15,7 +15,7 @@ No pedestal subtraction.  Per channel,
     photons = HG / ADC_PER_PHOTON                      normally
             = (LG * LG_SCALE) / ADC_PER_PHOTON         when HG > HG_SAT
 
-with LG_SCALE = 10 (constant, not the fitted per-channel value), HG_SAT = 4000
+with LG_SCALE = 10 (constant, not the fitted per-channel value), HG_SAT = 3900
 and ADC_PER_PHOTON = 35.  The result is rounded to the nearest integer and
 clipped at 0; a channel missing from the event counts as 0.
 
@@ -70,7 +70,8 @@ channel that never fires is called out by name.  --trig-channels and
 
 Diagnostic plots
 ----------------
-Written on every run (--no-map to skip) as <output>_avgPhotons.pdf, 16 pages:
+Written on every run (--no-map to skip) as <output>_avgPhotons.pdf: 6 pages,
+or 16 with --showLGHG, which adds the HG-only and LG-only pages (7-16):
 
     1      average photons per channel, 16 x 4 map + the trigger channels
            (also saved on its own as <output>_avgPhotons.png)
@@ -79,8 +80,8 @@ Written on every run (--no-map to skip) as <output>_avgPhotons.pdf, 16 pages:
            ring's four SiPMs A, B, C, D are black, red, green, blue
     6      the 11 SiPMs of rings 15-5 summed per column: A (black) against
            B, C, D
-    7-11   the same five pages, HG only
-    12-16  the same five pages, LG only
+    7-11   the same five pages, HG only      (--showLGHG)
+    12-16  the same five pages, LG only      (--showLGHG)
 
 HG only is HG / ADC_PER_PHOTON and LG only is (LG * LG_SCALE) / ADC_PER_PHOTON
 for every entry, with no switch between them, so all three versions are in
@@ -115,7 +116,9 @@ NRING = RING_HI - RING_LO + 1    # 11 -> the width of the MC array
 
 ADC_PER_PHOTON = 35.0
 LG_SCALE = 10.0                  # constant, not the fitted per-channel k
-HG_SAT = 4000.0                  # HG strictly above this uses the LG branch
+HG_SAT = 3900.0                  # HG strictly above this uses the LG branch
+                                 # (below every channel's ceiling: some
+                                 # saturate just under 4000)
 
 MIN_PHOTONS = 1000
 NEDGE = 2                        # columns barred at each end for the max
@@ -785,9 +788,12 @@ def main(argv=None):
                         "distribution pages.  By default a "
                         "16 x 4 image of the average photons per channel, "
                         "with the six trigger channels on the left, is written "
-                        "as PNG and as page 1 of a 16-page PDF that also "
-                        "holds the per-SiPM photon distributions (HG/LG "
-                        "combination, HG only and LG only)")
+                        "as PNG and as page 1 of a 6-page PDF that also "
+                        "holds the per-SiPM photon distributions")
+    p.add_argument("--showLGHG", action="store_true",
+                   help="also write the HG-only and LG-only versions of the "
+                        "distribution pages (10 more pages, 16 in all).  "
+                        "Off by default")
     p.add_argument("--map-selected", action="store_true",
                    help="average the map over the events WRITTEN to the "
                         "output instead of over every event read, i.e. after "
@@ -895,6 +901,8 @@ def main(argv=None):
             sum_ph[c] += v
             d = hist_ph[c]
             d[v] = d.get(v, 0) + 1
+            if not args.showLGHG:
+                continue
             v = photons_single(h, 1.0, args.adc_per_photon)
             d = hist_hg[c]
             d[v] = d.get(v, 0) + 1
@@ -1043,6 +1051,8 @@ def main(argv=None):
              "(LG*%g)/%g for every entry (no HG)"
              % (args.lg_scale, args.adc_per_photon), hist_lg),
         ]
+        if not args.showLGHG:
+            variants = variants[:1]
         for pth in write_photon_map(map_stem, sum_ph, n_map, scope, src, args,
                                     variants):
             print("wrote %s" % pth)
