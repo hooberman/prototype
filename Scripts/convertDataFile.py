@@ -68,6 +68,29 @@ the per-channel fire rate is always printed, cut on or not, and a required
 channel that never fires is called out by name.  --trig-channels and
 --trig-nmin change which channels are required and how many of them.
 
+Diagnostic plots
+----------------
+Written on every run (--no-map to skip) as <output>_avgPhotons.pdf, 6 pages:
+
+    1     average photons per channel, 16 x 4 map + the trigger channels
+          (also saved on its own as <output>_avgPhotons.png)
+    2-5   photon-count distributions, four rings per page in a 2 x 2 array
+          (15-12, 11-8, 7-4, 3-0); in each panel the ring's four SiPMs
+          A, B, C, D are black, red, green, blue
+    6     the 11 SiPMs of rings 15-5 summed per column: A (black) against
+          B, C, D
+
+The distributions are over the same events as the map (all events read, or
+the written ones with --map-selected).  Bins are variable width (HIST_EDGES):
+5 photons wide up to 50, 10 for 50-100, 20 for 100-200, 50 for 200-300 and
+100 for 300-500, and the y axis is events per photon (bin content / bin
+width) so the shape is continuous across the width changes.  Entries above
+500 go into the last bin.  Under every distribution is a ratio panel: each
+curve divided by the average of the curves in that panel, same binning, with
+Poisson error bars (the curve's own share of the average is accounted for).
+--hist-xmax and/or --hist-bins switch to uniform
+bins instead.
+
 The first few events are printed in full so the ring ordering and the
 conversion can be checked by eye.
 """
@@ -333,10 +356,216 @@ def channel_grid(avg):
     return grid
 
 
-def write_photon_map(out_stem, sum_ph, nev, scope, src, args):
+# variable-width bin edges for the distribution pages: (upper edge, step)
+HIST_STEPS = [(50, 5), (100, 10), (200, 20), (300, 50), (500, 100)]
+HIST_EDGES = [0]
+for _hi, _step in HIST_STEPS:
+    while HIST_EDGES[-1] < _hi:
+        HIST_EDGES.append(HIST_EDGES[-1] + _step)
+
+HIST_COLORS = {"A": "black", "B": "red", "C": "green", "D": "blue"}
+RING_PAGES = [(15, 14, 13, 12), (11, 10, 9, 8), (7, 6, 5, 4), (3, 2, 1, 0)]
+
+# (column letter, ring) -> ch, the inverse of CHMAP
+CH_AT = {v: k for k, v in CHMAP.items()}
+
+
+def _merge(counters):
+    tot = {}
+    for d in counters:
+        for k, v in d.items():
+            tot[k] = tot.get(k, 0) + v
+    return tot
+
+
+def _stats(d):
+    """(entries, mean, max) of a {photons: events} counter."""
+    n = sum(d.values())
+    if not n:
+        return 0, 0.0, 0
+    return n, sum(k * v for k, v in d.items()) / float(n), max(d)
+
+
+def _auto_xmax(hist_ph):
+    """Upper edge that holds 99.5 % of all non-zero SiPM entries."""
+    tot = _merge(hist_ph[ch] for ch in CHMAP)
+    tot.pop(0, None)
+    n = sum(tot.values())
+    if not n:
+        return 50
+    acc = 0
+    for k in sorted(tot):
+        acc += tot[k]
+        if acc >= 0.995 * n:
+            return max(50, int(k) + 1)
+    return max(50, max(tot) + 1)
+
+
+def _draw_hist(ax, np, d, edges, color, label):
+    """One step histogram from a {photons: events} counter; overflow goes
+    into the last bin so nothing is silently lost."""
+    if not d:
+        ax.plot([], [], color=color, lw=1.1, label=label + "  (no entries)")
+        return 0, np.zeros(len(edges) - 1)
+    vals = np.fromiter(d.keys(), dtype=float, count=len(d))
+    wts = np.fromiter(d.values(), dtype=float, count=len(d))
+    nover = float(wts[vals >= edges[-1]].sum())
+    vals = np.minimum(vals, 0.5 * (edges[-1] + edges[-2]))
+    h, _ = np.histogram(vals, bins=edges, weights=wts)
+    ax.stairs(h / np.diff(edges), edges, color=color, lw=1.1, label=label)
+    return nover, h
+
+
+RATIO_YMAX = 2.0
+
+
+def _draw_ratio(ax, np, edges, counts, any_over):
+    """Each curve over the average of the curves in the panel.
+
+    counts is [(color, raw bin contents)].  With S the bin's sum over the n
+    curves and h one curve's content, ratio = n h / S.  The curve is part of
+    its own denominator, so the Poisson error is not the naive quadrature sum
+    but  sigma = n sqrt(h (S - h) / S^3).
+    Points above the axis range are drawn as arrows at the top edge.
+    """
+    n = len(counts)
+    ax.axhline(1.0, color="0.45", lw=0.8)
+    if n:
+        S = np.sum([h for _, h in counts], axis=0)
+        ok = S > 0
+        ctr = 0.5 * (edges[:-1] + edges[1:])
+        wid = np.diff(edges)
+        for i, (color, h) in enumerate(counts):
+            Ssafe = np.where(ok, S, 1.0)
+            r = n * h / Ssafe
+            e = n * np.sqrt(np.clip(h * (S - h), 0, None) / Ssafe ** 3)
+            # small sideways shift so the four sets of bars do not overlap
+            x = ctr + (i - 0.5 * (n - 1)) * 0.16 * wid
+            m = ok & (r <= RATIO_YMAX)
+            ax.errorbar(x[m], r[m], yerr=e[m], fmt="o", ms=2.2, lw=0.8,
+                        color=color, capsize=0)
+            hi = ok & (r > RATIO_YMAX)
+            ax.plot(x[hi], np.full(hi.sum(), RATIO_YMAX * 0.96), "^", ms=3.5,
+                    color=color, clip_on=False)
+    ax.set_xlim(edges[0], edges[-1])
+    ax.set_ylim(0.0, RATIO_YMAX)
+    ax.set_yticks([0.5, 1.0, 1.5])
+    ax.set_ylabel("ratio to avg", fontsize=8.5)
+    ax.set_xlabel("photons%s" % ("   (last bin = overflow)" if any_over
+                                 else ""), fontsize=9)
+    ax.tick_params(labelsize=8)
+    ax.grid(True, which="major", color="0.88", lw=0.5)
+    ax.set_axisbelow(True)
+
+
+def _panel_pair(fig, cell):
+    """A distribution axis with a ratio axis glued underneath, sharing x."""
+    sub = cell.subgridspec(2, 1, height_ratios=[3.0, 1.15], hspace=0.0)
+    ax = fig.add_subplot(sub[0])
+    axr = fig.add_subplot(sub[1], sharex=ax)
+    return ax, axr
+
+
+def _hist_axes(ax, np, edges, logy, any_over):
+    ax.set_xlim(edges[0], edges[-1])
+    if logy:
+        ax.set_yscale("log")
+        # half of one event in the widest bin, so a single entry still shows
+        ax.set_ylim(bottom=0.5 / float(np.diff(edges).max()))
+    else:
+        ax.set_ylim(bottom=0)
+    ax.set_ylabel("events / photon   (bin content / bin width)", fontsize=9)
+    ax.tick_params(labelsize=8)
+    ax.tick_params(axis="x", labelbottom=False)     # the ratio panel has it
+    ax.grid(True, which="major", color="0.88", lw=0.5)
+    ax.set_axisbelow(True)
+
+
+def hist_pages(plt, np, hist_ph, nev, scope, src, args):
+    """Pages 2-6: yields one figure at a time."""
+    if args.hist_xmax or args.hist_bins:         # uniform bins on request
+        xmax = args.hist_xmax if args.hist_xmax else _auto_xmax(hist_ph)
+        nb = args.hist_bins
+        if not nb:                   # integer-width bins, about 100 of them
+            width = max(1, int(round(xmax / 100.0)))
+            nb = int(-(-xmax // width))
+            xmax = nb * width
+        edges = np.linspace(0.0, float(xmax), nb + 1)
+    else:
+        edges = np.array(HIST_EDGES, dtype=float)
+    logy = not args.hist_liny
+    sub = ("%d events %s   |   %s   |   photons = HG/%g, or (LG*%g)/%g when "
+           "HG > %g" % (nev, scope, os.path.basename(src),
+                        args.adc_per_photon, args.lg_scale,
+                        args.adc_per_photon, args.hg_sat))
+
+    # ---- four pages, four rings each, A B C D overlaid in each panel ----
+    for rings in RING_PAGES:
+        fig = plt.figure(figsize=(11.0, 8.5))
+        outer = fig.add_gridspec(2, 2, left=0.075, right=0.985, bottom=0.06,
+                                 top=0.875, wspace=0.20, hspace=0.30)
+        for cell, ring in zip(outer, rings):
+            ax, axr = _panel_pair(fig, cell)
+            over = 0
+            counts = []
+            for col in COLS:
+                ch = CH_AT.get((col, ring))
+                if ch is None:
+                    ax.plot([], [], color=HIST_COLORS[col], lw=1.1,
+                            label="%s%d  n/c" % (col, ring))
+                    continue
+                n, mean, mx = _stats(hist_ph[ch])
+                nover, h = _draw_hist(
+                    ax, np, hist_ph[ch], edges, HIST_COLORS[col],
+                    "%s%d  ch%d  mean %.1f  max %d" % (col, ring, ch, mean, mx))
+                over += nover
+                counts.append((HIST_COLORS[col], h))
+            _hist_axes(ax, np, edges, logy, over)
+            _draw_ratio(axr, np, edges, counts, over)
+            ax.set_title("ring %d%s" % (ring, "" if ring >= RING_LO
+                                        else "   (not in the 4 x %d output)"
+                                        % NRING), fontsize=10.5)
+            ax.legend(fontsize=7.5, loc="upper right", frameon=False)
+        fig.suptitle("SiPM photon distributions  -  rings %d-%d"
+                     % (rings[0], rings[-1]), fontsize=13, y=0.975)
+        fig.text(0.5, 0.935, sub, ha="center", va="top", fontsize=8,
+                 color="0.25")
+        yield fig
+
+    # ---- rings 15-5 summed, one curve per column ----
+    fig = plt.figure(figsize=(11.0, 8.5))
+    outer = fig.add_gridspec(1, 1, left=0.075, right=0.985, bottom=0.06,
+                             top=0.875)
+    ax, axr = _panel_pair(fig, outer[0])
+    over = 0
+    counts = []
+    for col in COLS:
+        chans = [CH_AT[(col, r)] for r in range(RING_HI, RING_LO - 1, -1)
+                 if (col, r) in CH_AT]
+        tot = _merge(hist_ph[ch] for ch in chans)
+        n, mean, mx = _stats(tot)
+        nover, h = _draw_hist(ax, np, tot, edges, HIST_COLORS[col],
+                              "%s%d-%s%d  (%d SiPMs, %d entries)  mean %.1f  "
+                              "max %d" % (col, RING_HI, col, RING_LO,
+                                          len(chans), n, mean, mx))
+        over += nover
+        counts.append((HIST_COLORS[col], h))
+    _hist_axes(ax, np, edges, logy, over)
+    _draw_ratio(axr, np, edges, counts, over)
+    ax.legend(fontsize=9.5, loc="upper right", frameon=False)
+    fig.suptitle("SiPM photon distributions  -  rings %d-%d combined, by "
+                 "column" % (RING_HI, RING_LO), fontsize=13, y=0.975)
+    fig.text(0.5, 0.935, sub + "\none entry per SiPM per event", ha="center",
+             va="top", fontsize=8, color="0.25", linespacing=1.5)
+    yield fig
+
+
+def write_photon_map(out_stem, sum_ph, nev, scope, src, args, hist_ph=None):
     """Average photons per channel as a 16 x 4 image, triggers on the left.
 
-    Written on every run, PNG and PDF.  matplotlib is imported here rather
+    Written on every run.  The PNG is this map alone; the PDF has it as page
+    1, followed by the photon-count distributions (see hist_pages) when
+    hist_ph is given.  matplotlib is imported here rather
     than at the top so that a machine without it can still do the conversion:
     the map is a diagnostic, not the product.
     """
@@ -345,6 +574,7 @@ def write_photon_map(out_stem, sum_ph, nev, scope, src, args):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.colors import Normalize
+        from matplotlib.backends.backend_pdf import PdfPages
         import numpy as np
     except ImportError as exc:
         print("  no photon map: %s (matplotlib/numpy not available)" % exc)
@@ -445,9 +675,14 @@ def write_photon_map(out_stem, sum_ph, nev, scope, src, args):
              linespacing=1.5)
 
     paths = [out_stem + ".png", out_stem + ".pdf"]
-    for p in paths:
-        fig.savefig(p, dpi=150)
-    plt.close(fig)
+    fig.savefig(paths[0], dpi=150)
+    with PdfPages(paths[1]) as pdf:
+        pdf.savefig(fig)
+        plt.close(fig)
+        if hist_ph is not None:
+            for hfig in hist_pages(plt, np, hist_ph, nev, scope, src, args):
+                pdf.savefig(hfig)
+                plt.close(hfig)
     return paths
 
 
@@ -507,14 +742,27 @@ def main(argv=None):
                    help="output stem for the average-photon map (default: the "
                         "output text file's name with _avgPhotons)")
     p.add_argument("--no-map", action="store_true",
-                   help="do not write the average-photon map.  By default a "
+                   help="do not write the average-photon map or the "
+                        "distribution pages.  By default a "
                         "16 x 4 image of the average photons per channel, "
                         "with the six trigger channels on the left, is written "
-                        "as PNG and PDF on every run")
+                        "as PNG and as page 1 of a 6-page PDF that also "
+                        "holds the per-SiPM photon distributions")
     p.add_argument("--map-selected", action="store_true",
                    help="average the map over the events WRITTEN to the "
                         "output instead of over every event read, i.e. after "
                         "the trigger and photon cuts")
+    p.add_argument("--hist-xmax", type=float, default=None, metavar="N",
+                   help="upper edge, in photons, of the distribution pages "
+                        "with UNIFORM bins, instead of the default variable "
+                        "bins (5 to 50, 10 to 100, 20 to 200, 50 to 300, 100 "
+                        "to 500).  Anything above goes into the last bin")
+    p.add_argument("--hist-bins", type=int, default=None, metavar="N",
+                   help="use this many UNIFORM bins on the distribution "
+                        "pages instead of the default variable bins")
+    p.add_argument("--hist-liny", action="store_true",
+                   help="linear y axis on the distribution pages (default "
+                        "log)")
     p.add_argument("--no-select", action="store_true",
                    help="convert every event, applying neither selection")
     p.add_argument("--max-events", type=int, default=None,
@@ -590,8 +838,19 @@ def main(argv=None):
 
     # running sum of photons per channel, for the map.  All 64 channels, not
     # just the 44 that reach the output, and streamed like everything else.
+    # hist_ph[ch] is {photons: events}: the full distribution, exactly, at a
+    # cost of one small dict per channel whatever the file size.
     sum_ph = [0.0] * NCH
+    hist_ph = [dict() for _ in range(NCH)]
     n_map = 0
+
+    def accumulate(hg, lg):
+        for c in range(NCH):
+            v = photons(hg.get(c), lg.get(c), args.adc_per_photon,
+                        args.lg_scale, args.hg_sat)
+            sum_ph[c] += v
+            d = hist_ph[c]
+            d[v] = d.get(v, 0) + 1
 
     n = nt = n1 = n12 = nsat_tot = 0
     nfired_hist = [0] * (len(required) + 1)     # among the REQUIRED channels
@@ -619,10 +878,7 @@ def main(argv=None):
 
             if not args.no_map and not args.map_selected:
                 n_map += 1
-                for c in range(NCH):
-                    sum_ph[c] += photons(hg.get(c), lg.get(c),
-                                         args.adc_per_photon, args.lg_scale,
-                                         args.hg_sat)
+                accumulate(hg, lg)
 
             img, nsat = make_image(hg, lg, args.adc_per_photon,
                                    args.lg_scale, args.hg_sat)
@@ -650,10 +906,7 @@ def main(argv=None):
 
             if keep and not args.no_map and args.map_selected:
                 n_map += 1
-                for c in range(NCH):
-                    sum_ph[c] += photons(hg.get(c), lg.get(c),
-                                         args.adc_per_photon, args.lg_scale,
-                                         args.hg_sat)
+                accumulate(hg, lg)
 
             if keep:
                 out.write("%d\n" % trgid)
@@ -727,7 +980,8 @@ def main(argv=None):
             (out_path[:-4] if out_path.lower().endswith(".txt") else out_path)
             + "_avgPhotons")
         scope = "written to the output" if args.map_selected else "read"
-        for pth in write_photon_map(map_stem, sum_ph, n_map, scope, src, args):
+        for pth in write_photon_map(map_stem, sum_ph, n_map, scope, src, args,
+                                    hist_ph):
             print("wrote %s" % pth)
     return 0
 
