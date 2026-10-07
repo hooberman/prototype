@@ -70,15 +70,22 @@ channel that never fires is called out by name.  --trig-channels and
 
 Diagnostic plots
 ----------------
-Written on every run (--no-map to skip) as <output>_avgPhotons.pdf, 6 pages:
+Written on every run (--no-map to skip) as <output>_avgPhotons.pdf, 16 pages:
 
-    1     average photons per channel, 16 x 4 map + the trigger channels
-          (also saved on its own as <output>_avgPhotons.png)
-    2-5   photon-count distributions, four rings per page in a 2 x 2 array
-          (15-12, 11-8, 7-4, 3-0); in each panel the ring's four SiPMs
-          A, B, C, D are black, red, green, blue
-    6     the 11 SiPMs of rings 15-5 summed per column: A (black) against
-          B, C, D
+    1      average photons per channel, 16 x 4 map + the trigger channels
+           (also saved on its own as <output>_avgPhotons.png)
+    2-5    photon-count distributions, HG/LG combination, four rings per
+           page in a 2 x 2 array (15-12, 11-8, 7-4, 3-0); in each panel the
+           ring's four SiPMs A, B, C, D are black, red, green, blue
+    6      the 11 SiPMs of rings 15-5 summed per column: A (black) against
+           B, C, D
+    7-11   the same five pages, HG only
+    12-16  the same five pages, LG only
+
+HG only is HG / ADC_PER_PHOTON and LG only is (LG * LG_SCALE) / ADC_PER_PHOTON
+for every entry, with no switch between them, so all three versions are in
+photons on the same bins.  HG only therefore piles up near
+HG_SAT / ADC_PER_PHOTON where the ADC saturates.
 
 The distributions are over the same events as the map (all events read, or
 the written ones with --map-selected).  Bins are variable width (HIST_EDGES):
@@ -192,6 +199,16 @@ def photons(hg, lg, adc_per_photon=ADC_PER_PHOTON, lg_scale=LG_SCALE,
     else:
         v = hg / adc_per_photon
     n = int(round(v))
+    return n if n > 0 else 0
+
+
+def photons_single(adc, scale, adc_per_photon=ADC_PER_PHOTON):
+    """Photon count from ONE gain alone, no HG/LG switch: adc*scale/adc_per_
+    photon, rounded and clipped at 0 like photons().  scale is 1 for HG and
+    LG_SCALE for LG.  None in -> 0 out."""
+    if adc is None:
+        return 0
+    n = int(round((adc * scale) / adc_per_photon))
     return n if n > 0 else 0
 
 
@@ -481,10 +498,32 @@ def _hist_axes(ax, np, edges, logy, any_over):
     ax.set_axisbelow(True)
 
 
-def hist_pages(plt, np, hist_ph, nev, scope, src, args):
-    """Pages 2-6: yields one figure at a time."""
+def all_hist_pages(plt, np, variants, nev, scope, src, args):
+    """Pages 2-16: every distribution page three times over.
+
+    variants is [(tag, formula, hist)], the combination first.  All five
+    pages of one variant come out before the next variant starts: combination
+    (pages 2-6), HG only (7-11), LG only (12-16).  All three use the same bin
+    edges (taken from the combination when --hist-xmax is automatic).
+    """
+    xmax_hist = variants[0][2]
+    for tag, formula, hist in variants:
+        for fig in hist_pages(plt, np, hist, nev, scope, src, args, tag,
+                              formula, xmax_hist):
+            yield fig
+
+
+def hist_pages(plt, np, hist_ph, nev, scope, src, args, tag="", formula=None,
+               xmax_hist=None):
+    """The five distribution pages of ONE variant, one figure at a time."""
+    if formula is None:
+        formula = ("HG/%g, or (LG*%g)/%g when HG > %g"
+                   % (args.adc_per_photon, args.lg_scale,
+                      args.adc_per_photon, args.hg_sat))
+    ttag = ", %s" % tag if tag else ""
     if args.hist_xmax or args.hist_bins:         # uniform bins on request
-        xmax = args.hist_xmax if args.hist_xmax else _auto_xmax(hist_ph)
+        xmax = args.hist_xmax if args.hist_xmax else _auto_xmax(
+            xmax_hist if xmax_hist is not None else hist_ph)
         nb = args.hist_bins
         if not nb:                   # integer-width bins, about 100 of them
             width = max(1, int(round(xmax / 100.0)))
@@ -494,10 +533,8 @@ def hist_pages(plt, np, hist_ph, nev, scope, src, args):
     else:
         edges = np.array(HIST_EDGES, dtype=float)
     logy = not args.hist_liny
-    sub = ("%d events %s   |   %s   |   photons = HG/%g, or (LG*%g)/%g when "
-           "HG > %g" % (nev, scope, os.path.basename(src),
-                        args.adc_per_photon, args.lg_scale,
-                        args.adc_per_photon, args.hg_sat))
+    sub = ("%d events %s   |   %s   |   photons = %s"
+           % (nev, scope, os.path.basename(src), formula))
 
     # ---- four pages, four rings each, A B C D overlaid in each panel ----
     for rings in RING_PAGES:
@@ -526,8 +563,8 @@ def hist_pages(plt, np, hist_ph, nev, scope, src, args):
                                         else "   (not in the 4 x %d output)"
                                         % NRING), fontsize=10.5)
             ax.legend(fontsize=7.5, loc="upper right", frameon=False)
-        fig.suptitle("SiPM photon distributions  -  rings %d-%d"
-                     % (rings[0], rings[-1]), fontsize=13, y=0.975)
+        fig.suptitle("SiPM photon distributions%s  -  rings %d-%d"
+                     % (ttag, rings[0], rings[-1]), fontsize=13, y=0.975)
         fig.text(0.5, 0.935, sub, ha="center", va="top", fontsize=8,
                  color="0.25")
         yield fig
@@ -553,19 +590,20 @@ def hist_pages(plt, np, hist_ph, nev, scope, src, args):
     _hist_axes(ax, np, edges, logy, over)
     _draw_ratio(axr, np, edges, counts, over)
     ax.legend(fontsize=9.5, loc="upper right", frameon=False)
-    fig.suptitle("SiPM photon distributions  -  rings %d-%d combined, by "
-                 "column" % (RING_HI, RING_LO), fontsize=13, y=0.975)
+    fig.suptitle("SiPM photon distributions%s  -  rings %d-%d summed, by "
+                 "column" % (ttag, RING_HI, RING_LO), fontsize=13, y=0.975)
     fig.text(0.5, 0.935, sub + "\none entry per SiPM per event", ha="center",
              va="top", fontsize=8, color="0.25", linespacing=1.5)
     yield fig
 
 
-def write_photon_map(out_stem, sum_ph, nev, scope, src, args, hist_ph=None):
+def write_photon_map(out_stem, sum_ph, nev, scope, src, args, hists=None):
     """Average photons per channel as a 16 x 4 image, triggers on the left.
 
     Written on every run.  The PNG is this map alone; the PDF has it as page
-    1, followed by the photon-count distributions (see hist_pages) when
-    hist_ph is given.  matplotlib is imported here rather
+    1, followed by the photon-count distributions (see all_hist_pages) when
+    hists, a list of (tag, formula, hist) variants, is given.  matplotlib is
+    imported here rather
     than at the top so that a machine without it can still do the conversion:
     the map is a diagnostic, not the product.
     """
@@ -679,8 +717,9 @@ def write_photon_map(out_stem, sum_ph, nev, scope, src, args, hist_ph=None):
     with PdfPages(paths[1]) as pdf:
         pdf.savefig(fig)
         plt.close(fig)
-        if hist_ph is not None:
-            for hfig in hist_pages(plt, np, hist_ph, nev, scope, src, args):
+        if hists:
+            for hfig in all_hist_pages(plt, np, hists, nev, scope, src,
+                                       args):
                 pdf.savefig(hfig)
                 plt.close(hfig)
     return paths
@@ -746,8 +785,9 @@ def main(argv=None):
                         "distribution pages.  By default a "
                         "16 x 4 image of the average photons per channel, "
                         "with the six trigger channels on the left, is written "
-                        "as PNG and as page 1 of a 6-page PDF that also "
-                        "holds the per-SiPM photon distributions")
+                        "as PNG and as page 1 of a 16-page PDF that also "
+                        "holds the per-SiPM photon distributions (HG/LG "
+                        "combination, HG only and LG only)")
     p.add_argument("--map-selected", action="store_true",
                    help="average the map over the events WRITTEN to the "
                         "output instead of over every event read, i.e. after "
@@ -842,14 +882,24 @@ def main(argv=None):
     # cost of one small dict per channel whatever the file size.
     sum_ph = [0.0] * NCH
     hist_ph = [dict() for _ in range(NCH)]
+    # the same, from each gain on its own (no HG/LG switch), in photons
+    hist_hg = [dict() for _ in range(NCH)]
+    hist_lg = [dict() for _ in range(NCH)]
     n_map = 0
 
     def accumulate(hg, lg):
         for c in range(NCH):
-            v = photons(hg.get(c), lg.get(c), args.adc_per_photon,
-                        args.lg_scale, args.hg_sat)
+            h, l = hg.get(c), lg.get(c)
+            v = photons(h, l, args.adc_per_photon, args.lg_scale,
+                        args.hg_sat)
             sum_ph[c] += v
             d = hist_ph[c]
+            d[v] = d.get(v, 0) + 1
+            v = photons_single(h, 1.0, args.adc_per_photon)
+            d = hist_hg[c]
+            d[v] = d.get(v, 0) + 1
+            v = photons_single(l, args.lg_scale, args.adc_per_photon)
+            d = hist_lg[c]
             d[v] = d.get(v, 0) + 1
 
     n = nt = n1 = n12 = nsat_tot = 0
@@ -980,8 +1030,21 @@ def main(argv=None):
             (out_path[:-4] if out_path.lower().endswith(".txt") else out_path)
             + "_avgPhotons")
         scope = "written to the output" if args.map_selected else "read"
+        variants = [
+            ("HG/LG combination",
+             "HG/%g, or (LG*%g)/%g when HG > %g"
+             % (args.adc_per_photon, args.lg_scale, args.adc_per_photon,
+                args.hg_sat), hist_ph),
+            ("HG only",
+             "HG/%g for every entry (no LG switch; saturates near %g/%g)"
+             % (args.adc_per_photon, args.hg_sat, args.adc_per_photon),
+             hist_hg),
+            ("LG only",
+             "(LG*%g)/%g for every entry (no HG)"
+             % (args.lg_scale, args.adc_per_photon), hist_lg),
+        ]
         for pth in write_photon_map(map_stem, sum_ph, n_map, scope, src, args,
-                                    hist_ph):
+                                    variants):
             print("wrote %s" % pth)
     return 0
 
