@@ -2,15 +2,29 @@
 """
 applyCNN.py
 
-Run the trained muon-direction network over a formatted DATA file and write
-out the predicted (theta, phi) per event, plus a one-page figure with the
-theta distribution, the phi distribution and a circular theta-vs-phi
-radiograph.
+Run a trained muon-direction network over a formatted DATA file and write out
+the predicted (theta, phi) per event, plus a one-page figure with the theta
+distribution, the phi distribution and a circular theta-vs-phi radiograph.
 
-    python applyCNN.py Run140_list_formatted_1000photons_innerRing3.txt
+    python applyCNN.py Run152_list_formatted_1000photons_innerRing3.txt \
+        --modelType FullSC_wphi100
 
-        -> Run140_list_formatted_1000photons_innerRing3_CNN.txt
-           Run140_list_formatted_1000photons_innerRing3_CNN.png  (+ .pdf)
+        -> Run152_list_formatted_1000photons_innerRing3_FullSC_wphi100_CNN.txt
+           Run152_list_formatted_1000photons_innerRing3_FullSC_wphi100_CNN.png
+           (+ .pdf, and _CNN_displays/ if per-event output is asked for)
+
+--modelType is one of
+
+    FullSC (default)   FullSC_wphi100
+    Simple
+    SimpleWrap         SimpleWrap_eqdeg
+    UnitSC             UnitSC_wphi100
+
+and is also the label in every output filename, so runs of different models
+on the same file never overwrite each other.  --model-dir overrides it with
+an explicit path; the label is then built from that run directory's name
+(ResNet2_<variant>_..._<extra tags>_..., keeping the variant and the extra
+tags such as wphi100 or eqdeg).
 
 Input
 -----
@@ -21,15 +35,39 @@ the layout is detected from the file, not assumed.
 
 Model
 -----
-MODEL_DIR below, or --model-dir.  Only two files are needed from it:
+MODEL_BASE / MODEL_TYPES below, chosen with --modelType, or --model-dir.
+Only two files are needed from it:
 
     model_scripted.pt   the network (TorchScript: no class definitions, no
                         training script)
-    model_config.json   img_mean / img_std, theta_mean / theta_std, phi_lo
+    model_config.json   img_mean / img_std, theta_mean / theta_std, and the
+                        phi decoding constants for the head in question
 
-The network returns (theta_norm, s, c); theta comes back as
-theta_norm * theta_std + theta_mean and phi as atan2(s, c), with |(s, c)| as
-the per-event confidence in phi.
+The head is DETERMINED, not assumed.  Before any data is touched the network
+is run once on a blank 4 x 11 image to measure its output width, and that is
+combined with the config to pick the decoder:
+
+    width 3, (theta_norm, s, c)       sincos   (FullSC models)
+        phi = atan2(s, c),  conf = |(s, c)|, a real per-event confidence
+    width 3, (theta_norm, s, c)       unitSC   (model.variant says unitSC)
+        phi = atan2(s, c),  conf = |(s, c)|, but the loss pins it near 1, so
+        it is a health check on the event rather than a confidence
+    width 2, (theta_norm, phi_rad)    simplePhi  (Simple models; no phi_std)
+        phi = degrees(out[1]),  no confidence
+    width 2, (theta_norm, phi_norm)   simpleWrap (postprocessing has phi_std)
+        phi = out[1] * phi_std + phi_mean -- a RESCALE in degrees, NOT
+        radians,  no confidence
+
+The two width-2 heads cannot be told apart by width, which is why the config
+decides between them.  If model.variant in the config names a head that
+disagrees with the measured width, a warning is printed and the width wins.
+
+theta is the same on every head: theta_norm * theta_std + theta_mean.
+
+On a head with no confidence, everything that used it degrades cleanly:
+--min-conf is refused, the scatter radiograph draws plain dots, the phi_conf
+column of the text output is zeros (with a header line saying so) and the
+confidence summary is not printed.
 
 Units
 -----
@@ -64,7 +102,32 @@ import matplotlib.pyplot as plt
 warnings.simplefilter("ignore", FutureWarning)
 
 # ----------------------------------------------------------------------------
-MODEL_DIR = ("../ScintillatorAI/plots/sipm_hits_PoC_4p85Mevents_runs1-485_CNN_1000photons_innerRing3/ResNet2_sincos_nTiles2_nSiPM2_mV10_5epochs/model")
+#MODEL_DIR = ("../ScintillatorAI/plots/sipm_hits_PoC_4p85Mevents_runs1-485_CNN_1000photons_innerRing3/ResNet2_sincos_nTiles2_nSiPM2_mV10_5epochs/model")
+#MODEL_DIR = ("/Users/muonix/ScintillatorAI/IllinoisComputes/plots2/sipm_hits_PoC_14p85Mevents_runs1-485_1001-2000_CNN_1000photons_innerRing3/ResNet2_unitSC_nTiles2_nSiPM2_mV10_20epochs/model")
+#MODEL_DIR = ("/Users/muonix/ScintillatorAI/plots/sipm_hits_PoC_14p85Mevents_runs1-485_1001-2000_CNN_1000photons_innerRing3/ResNet2_simplePhi_nTiles2_nSiPM2_mV10_5epochs_Take2/model")
+#MODEL_DIR = ("/Users/muonix/ScintillatorAI/IllinoisComputes/plots3/sipm_hits_PoC_14p85Mevents_runs1-485_1001-2000_CNN_1000photons_innerRing3/ResNet2_simpleWrap_nTiles2_nSiPM2_mV10_tiles11_phi135-225_20epochs/model")
+#MODEL_DIR = ("/Users/muonix/ScintillatorAI/IllinoisComputes/plots4/sipm_hits_PoC_14p85Mevents_runs1-485_1001-2000_CNN_1000photons_innerRing3/ResNet2_simpleWrap_nTiles2_nSiPM2_mV10_tiles11_phi0-360_5epochs/model")
+#MODEL_DIR = ("/Users/muonix/ScintillatorAI/IllinoisComputes/plots5/sipm_hits_PoC_14p85Mevents_runs1-485_1001-2000_CNN_1000photons_innerRing3/ResNet2_simpleWrap_nTiles2_nSiPM2_mV10_tiles11_phi0-360_eqdeg_20epochs/model")
+#MODEL_DIR = ("/Users/muonix/ScintillatorAI/IllinoisComputes/plots6/sipm_hits_PoC_14p85Mevents_runs1-485_1001-2000_CNN_1000photons_innerRing3/ResNet2_simpleWrap_nTiles2_nSiPM2_mV10_tiles11_phi0-360_20epochs/model")
+
+# --modelType picks one of these run directories under MODEL_BASE; the model
+# itself is in <run>/model.  The key is also the label that goes into every
+# output filename, so outputs from different models never collide.
+# --model-dir still overrides all of this with an explicit path.
+MODEL_BASE = ("/Users/muonix/ScintillatorAI/IllinoisComputes/"
+              "sipm_hits_PoC_10Mevents_CNN_v2p4_1000photons_innerRing3")
+MODEL_TYPES = {
+    "FullSC":          "ResNet2_FullSC_nTiles2_nSiPM2_mV10_tiles11_50epochs_2026-09-30_19h01m",
+    "FullSC_wphi100":  "ResNet2_FullSC_nTiles2_nSiPM2_mV10_tiles11_wphi100_50epochs_2026-09-30_19h02m",
+    "Simple":          "ResNet2_Simple_nTiles2_nSiPM2_mV10_tiles11_50epochs_2026-09-30_19h01m",
+    "SimpleWrap":      "ResNet2_SimpleWrap_nTiles2_nSiPM2_mV10_tiles11_50epochs_2026-09-30_19h01m",
+    "SimpleWrap_eqdeg": "ResNet2_SimpleWrap_nTiles2_nSiPM2_mV10_tiles11_eqdeg_50epochs_2026-09-30_19h02m",
+    "UnitSC":          "ResNet2_UnitSC_nTiles2_nSiPM2_mV10_tiles11_50epochs_2026-09-30_19h01m",
+    "UnitSC_wphi100":  "ResNet2_UnitSC_nTiles2_nSiPM2_mV10_tiles11_wphi100_50epochs_2026-09-30_19h02m",
+}
+DEFAULT_MODEL_TYPE = "FullSC"
+
+
 # ----------------------------------------------------------------------------
 
 NROW = 4                # detector columns A, B, C, D
@@ -93,6 +156,36 @@ TARGET_FILL = "#a8d3f0"     # light blue
 TARGET_EDGE = "#3f88c5"
 DOT_COLOR = "#cc3311"       # the one red the dots take under --showTarget
 
+# names a head goes by (in model.variant or the run directory), lower case,
+# -> the canonical head.  Matched as WHOLE tokens, so "simple" does not
+# swallow "simplewrap".
+VARIANT_ALIASES = {"sincos": "sincos", "fullsc": "sincos",
+                   "unitsc": "unitsc",
+                   "simplephi": "simplephi", "simple": "simplephi",
+                   "simplewrap": "simplewrap"}
+# canonical head -> the output width it implies
+VARIANT_WIDTH = {"sincos": 3, "unitsc": 3, "simplephi": 2, "simplewrap": 2}
+
+# run-directory tokens that are the same for every model and say nothing
+# about which one it is; everything else after "ResNet2" goes in the label
+_COMMON_TOKEN = r"^(nTiles\d+|nSiPM\d+|mV\d+|tiles\d+|\d+epochs|" \
+                r"\d{4}-\d{2}-\d{2}|\d+h\d+m)$"
+
+
+def model_label(model_dir):
+    """Short, unique label for a model, from its run directory name.
+
+    ResNet2_FullSC_nTiles2_nSiPM2_mV10_tiles11_wphi100_50epochs_<date>_<time>
+        -> FullSC_wphi100
+    """
+    import re
+    run = os.path.basename(os.path.dirname(os.path.abspath(model_dir)))
+    toks = run.split("_")
+    if toks and toks[0].lower().startswith("resnet"):
+        toks = toks[1:]
+    keep = [t for t in toks if t and not re.match(_COMMON_TOKEN, t)]
+    return "_".join(keep) or run
+
 
 # ----------------------------------------------------------------------------
 # model
@@ -116,15 +209,137 @@ def load_model(model_dir):
     return model, cfg
 
 
+def _variant_from(cfg, model_dir):
+    """The head the config claims, as one of VARIANT_WIDTH's keys, or ''.
+
+    model.variant is the authority.  If it is missing, the run directory name
+    (ResNet2_sincos_..., ResNet2_SimpleWrap_...) is used as a fallback hint,
+    and the result says which it came from.
+    """
+    import re
+    v = str(cfg.get("model", {}).get("variant", "")).lower()
+    for tok in re.split(r"[^a-z0-9]+", v):
+        if tok in VARIANT_ALIASES:
+            return VARIANT_ALIASES[tok], "model.variant"
+    run = os.path.basename(os.path.dirname(os.path.abspath(model_dir))).lower()
+    for tok in run.split("_"):
+        if tok in VARIANT_ALIASES:
+            return VARIANT_ALIASES[tok], "run directory name"
+    return "", ""
+
+
+def detect_head(model, cfg, model_dir):
+    """Work out which output layout this model has, before any data is run.
+
+    The width is MEASURED by running the network once on a blank image; the
+    config then picks between heads of the same width.  Returns a dict:
+
+        name       sincos | unitSC | simplePhi | simpleWrap
+        nout       measured output width
+        has_conf   whether |(s,c)| exists for this head
+        decode     the formula, for the log and the output header
+        conf_note  what phi_conf means on this head
+    """
+    import torch
+    post = cfg["postprocessing"]
+    with torch.no_grad():
+        o = model(torch.zeros((1, 1, NROW, NRING), dtype=torch.float32))
+    o = o.cpu().numpy()
+    if o.ndim != 2 or o.shape[0] != 1:
+        sys.exit("unexpected model output shape %s for a single image; "
+                 "expected (1, 2) or (1, 3)" % (tuple(o.shape),))
+    nout = int(o.shape[1])
+
+    claimed, source = _variant_from(cfg, model_dir)
+
+    if nout == 3:
+        if claimed == "unitsc" or "unit" in str(
+                post.get("confidence_formula", "")).lower():
+            head = dict(
+                name="unitSC", has_conf=True,
+                decode="phi = atan2(s, c)",
+                conf_note="|(s,c)|; the unitSC loss anchors it near 1, so "
+                          "it is a health check on the event, not a "
+                          "confidence")
+        else:
+            head = dict(
+                name="sincos", has_conf=True,
+                decode="phi = atan2(s, c)",
+                conf_note="|(s,c)|, the network's confidence in phi "
+                          "(1 = sure, 0 = azimuthally ambiguous)")
+    elif nout == 2:
+        if "phi_std" in post or claimed == "simplewrap":
+            if "phi_std" not in post or "phi_mean" not in post:
+                sys.exit("this is a simpleWrap model (%s) but its "
+                         "postprocessing has no phi_mean/phi_std -- cannot "
+                         "decode phi.  Fix model_config.json."
+                         % (source or "phi_std present"))
+            head = dict(
+                name="simpleWrap", has_conf=False,
+                decode="phi = out[1] * phi_std + phi_mean  (standardised "
+                       "degrees, NOT radians)",
+                conf_note="none on this head; phi_conf is written as 0")
+        else:
+            head = dict(
+                name="simplePhi", has_conf=False,
+                decode="phi = degrees(out[1])",
+                conf_note="none on this head; phi_conf is written as 0")
+    else:
+        sys.exit("this model has %d outputs; expected 3 (theta_norm, s, c) "
+                 "or 2 (theta_norm, phi_rad | phi_norm)" % nout)
+
+    head["nout"] = nout
+    head["claimed"] = claimed
+    head["claimed_from"] = source
+    head["mismatch"] = bool(claimed) and VARIANT_WIDTH[claimed] != nout
+    return head
+
+
+def predict(model, cfg, head, images, batch_size=256):
+    """-> (theta_deg, phi_deg, conf).  conf is zeros on a no-confidence head,
+    so every caller keeps the same shape -- but nothing should interpret it."""
+    import torch
+    pre, post = cfg["preprocessing"], cfg["postprocessing"]
+    x = (images - pre["img_mean"]) / pre["img_std"]
+    outs = []
+    with torch.no_grad():
+        for k in range(0, x.shape[0], batch_size):
+            t = torch.from_numpy(x[k:k + batch_size][:, None, :, :]).float()
+            outs.append(model(t).cpu().numpy())
+    o = np.concatenate(outs, axis=0)
+    if o.shape[1] != head["nout"]:
+        sys.exit("model returned %d outputs on data but %d on the probe"
+                 % (o.shape[1], head["nout"]))
+
+    theta = o[:, 0] * post["theta_std"] + post["theta_mean"]
+
+    name = head["name"]
+    if name in ("sincos", "unitSC"):
+        s, c = o[:, 1], o[:, 2]
+        phi = np.degrees(np.arctan2(s, c))
+        conf = np.hypot(s, c)
+    elif name == "simpleWrap":
+        phi = o[:, 1] * post["phi_std"] + post["phi_mean"]
+        conf = np.zeros_like(phi)
+    else:                                   # simplePhi
+        phi = np.degrees(o[:, 1])
+        conf = np.zeros_like(phi)
+
+    # phi_lo is only present on the heads that define one; default [0, 360)
+    phi_lo = float(post.get("phi_lo", 0.0))
+    phi = (phi - phi_lo) % 360.0 + phi_lo
+    return theta, phi, conf
+
+
 # ----------------------------------------------------------------------------
 # the formatted data file
 # ----------------------------------------------------------------------------
 def read_formatted(path, nrow=NROW, nring=NRING):
     """Read convertDataFile.py output.
 
-    Returns (trgid (N,), images (N, nrow, nring) float32).  Works whether or
-    not the file carries the --placeholder block: the number of lines per
-    event is measured from the file.
+    Returns (trgid (N,), images (N, nrow, nring) float32, nblocks).  Works
+    whether or not the file carries the --placeholder block: the number of
+    lines per event is measured from the file.
     """
     with open(path) as f:
         lines = [ln.strip() for ln in f if ln.strip() != ""]
@@ -178,23 +393,6 @@ def training_cut(images, cfg):
     return ((per_tile >= nsipm).sum(axis=1) >= ntile).astype(int)
 
 
-def predict(model, cfg, images, batch_size=256):
-    import torch
-    pre, post = cfg["preprocessing"], cfg["postprocessing"]
-    x = (images - pre["img_mean"]) / pre["img_std"]
-    outs = []
-    with torch.no_grad():
-        for k in range(0, x.shape[0], batch_size):
-            t = torch.from_numpy(x[k:k + batch_size][:, None, :, :]).float()
-            outs.append(model(t).cpu().numpy())
-    o = np.concatenate(outs, axis=0)
-    theta = o[:, 0] * post["theta_std"] + post["theta_mean"]
-    s, c = o[:, 1], o[:, 2]
-    phi = np.degrees(np.arctan2(s, c))
-    phi = (phi - post["phi_lo"]) % 360.0 + post["phi_lo"]
-    return theta, phi, np.hypot(s, c)
-
-
 # ----------------------------------------------------------------------------
 # --showEventDisplays: one detector image per surviving event
 # ----------------------------------------------------------------------------
@@ -226,8 +424,9 @@ def write_event_text(img, out_txt, trgid, theta, phi, conf):
     it can be read back with the same code that reads the input file.  Note
     that is the transpose of the picture draw_photon_event() makes.
 
-    No comment lines: the header is exactly the four numbers asked for, so
-    the file parses with a bare loadtxt/split.
+    No comment lines: the header is exactly the four numbers, so the file
+    parses with a bare loadtxt/split.  On a no-confidence head the fourth
+    number is always 0 -- kept so the format does not change between models.
     """
     a = np.asarray(img, dtype=float)
     with open(out_txt, "w") as f:
@@ -341,8 +540,8 @@ def in_target(theta, phi, target_theta=TARGET_THETA, target_phi=TARGET_PHI):
 def draw_target(ax, target_theta=TARGET_THETA, target_phi=TARGET_PHI):
     """The shaded target wedge on the polar axes.
 
-    zorder 2: above the density (1) and below the dots (3), which is the
-    order asked for -- the muons have to be readable on top of the region.
+    zorder 2: above the density (1) and below the dots (3), so the muons stay
+    readable on top of the region.
     """
     tlo, thi = sorted(float(v) for v in target_theta)
     plo, phi_hi = sorted(float(v) for v in target_phi)
@@ -360,12 +559,9 @@ def draw_target(ax, target_theta=TARGET_THETA, target_phi=TARGET_PHI):
 def cos_power_curve(x_deg, tmax, n_in, binw_deg, power=2.0):
     """Expected muons per bin for a flux isotropic in phi and ~cos^p(theta).
 
-    The point of the sin(theta) factor: the flux per unit SOLID ANGLE goes as
-    cos^p(theta), but a zenith-angle histogram counts muons per unit THETA,
-    and the ring of directions at theta is 2 pi sin(theta) wide.  There are
-    simply more directions on the sky at 30 degrees than at 0, and a raw
-    cos^p curve drawn straight onto a theta histogram ignores that -- it
-    would peak at 0 where the data must go to zero.
+    The flux per unit SOLID ANGLE goes as cos^p(theta), but a zenith-angle
+    histogram counts muons per unit THETA, and the ring of directions at
+    theta is 2 pi sin(theta) wide, so
 
         dN/dtheta  ~  cos^p(theta) sin(theta)
 
@@ -386,8 +582,14 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
               nth=45, nph=36, style="auto", solid_angle=False,
               theta_max=None, radio_dphi=10.0, radio_dtheta=5.0,
               cos_power=2.0, show_cos=True, show_target=False,
-              target_theta=TARGET_THETA, target_phi=TARGET_PHI):
-    """One page: theta spectrum, phi spectrum, and the circular radiograph."""
+              target_theta=TARGET_THETA, target_phi=TARGET_PHI,
+              has_conf=True):
+    """One page: theta spectrum, phi spectrum, and the circular radiograph.
+
+    has_conf=False drops the confidence colouring from the scatter
+    radiograph -- colouring every point by a column of zeros would just be a
+    lie with a colourbar attached.
+    """
     n = theta.size
     # fixed range, so runs can be compared directly
     tmax = float(theta_max) if theta_max else THETA_MAX_DEG
@@ -396,8 +598,6 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
     tmax = float(radio_dtheta * np.ceil(tmax / radio_dtheta))
     n_over = int(np.sum(theta > tmax))
 
-    # explicit axes rather than a gridspec: the radiograph has to stay round
-    # and large, and the two spectra have to clear the header
     fig = plt.figure(figsize=(12.0, 14.5))
 
     ax_t = fig.add_axes([0.075, 0.735, 0.385, 0.165])
@@ -410,8 +610,6 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
               color="#2a78d6", alpha=0.25)
     ax_t.hist(theta, bins=np.linspace(0, tmax, nth + 1), histtype="step",
               color="#1b4f8f", lw=1.8)
-    # the expected shape for an isotropic-in-phi, cos^p flux, area-matched to
-    # the events inside the plotted range
     if show_cos:
         binw = tmax / float(nth)
         n_in = int(np.sum((theta >= 0) & (theta <= tmax)))
@@ -430,7 +628,6 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
     ax_t.set_title(r"zenith angle $\theta$", fontsize=12)
     ax_t.grid(alpha=0.25, lw=0.5)
     ax_t.set_xlim(0, tmax)
-    # the axis is fixed, so say plainly when events fell off the end of it
     if n_over:
         ax_t.annotate("%d event%s above %.0f$^\\circ$ not shown"
                       % (n_over, "" if n_over == 1 else "s", tmax),
@@ -440,17 +637,26 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
                                 edgecolor="none", alpha=0.85))
 
     # ---- 2. phi ----
-    ax_p.hist(phi, bins=np.linspace(0, 360, nph + 1), histtype="stepfilled",
-              color="#cc3311", alpha=0.22)
-    ax_p.hist(phi, bins=np.linspace(0, 360, nph + 1), histtype="step",
+    # same theta cut as the theta panel and the radiograph: only muons with
+    # theta <= tmax, so all three panels show the same events
+    phi_in = phi[theta <= tmax]
+    n_in_phi = phi_in.size
+    ax_p.hist(phi_in, bins=np.linspace(0, 360, nph + 1),
+              histtype="stepfilled", color="#cc3311", alpha=0.22)
+    ax_p.hist(phi_in, bins=np.linspace(0, 360, nph + 1), histtype="step",
               color="#8f2410", lw=1.8)
-    flat = n / float(nph)
+    if n_over:
+        ax_p.annotate("$\\theta$ $\\leq$ %.0f$^\\circ$ only  (%d event%s "
+                      "excluded)" % (tmax, n_over, "" if n_over == 1 else "s"),
+                      xy=(0.985, 0.965), xycoords="axes fraction",
+                      ha="right", va="top", fontsize=7.5, color="#cc3311",
+                      bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                                edgecolor="none", alpha=0.85))
+    flat = n_in_phi / float(nph)
     ax_p.axhline(flat, color="0.35", ls="--", lw=1.0)
     ax_p.annotate("flat = %.1f" % flat, xy=(0, flat),
                   xytext=(4, 3), textcoords="offset points",
                   ha="left", va="bottom", fontsize=7.5, color="0.35")
-    cmu, R = circ_stats(phi)
-    R_flat = 0.8862 / np.sqrt(n) if n else np.nan
     ax_p.set_xlabel(r"$\phi$ [degrees]", fontsize=11)
     ax_p.set_ylabel("muons / bin", fontsize=11)
     ax_p.set_title(r"azimuth $\phi$", fontsize=12)
@@ -465,19 +671,14 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
     ax_r.set_theta_direction(1)          # phi as atan2 gives it: CCW from +x
     ax_r.set_rlim(0, tmax)
     ax_r.set_rlabel_position(112.5)
-    # radial ticks strictly inside the rim: a label sitting exactly at tmax
-    # lands on top of the 90 deg angular label
     rstep = 10.0 if tmax > 50 else 5.0
     ax_r.set_rticks(np.arange(rstep, tmax - 1e-9, rstep))
     ax_r.grid(alpha=0.35, lw=0.6, color="0.5")
 
-    # the target wedge goes down first, so the muons land on top of it
     if show_target:
         draw_target(ax_r, target_theta, target_phi)
 
     if use_scatter and show_target:
-        # one colour, one size: the point of this plot is where the muons sit
-        # relative to the region, not what the network thought of each one
         ax_r.scatter(np.radians(phi), theta, s=14, color=DOT_COLOR,
                      alpha=0.85, edgecolors="none", zorder=3)
         ax_cb.set_visible(False)
@@ -486,7 +687,7 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
         note = ("one point per muon;  shaded: %g$^\\circ$ < $\\theta$ < "
                 "%g$^\\circ$, %g$^\\circ$ < $\\phi$ < %g$^\\circ$"
                 % (tlo, thi, plo, phi_hi))
-    elif use_scatter:
+    elif use_scatter and has_conf:
         sz = np.clip(6.0 + 40.0 * (conf / max(conf.max(), 1e-9)), 4, 55)
         sc = ax_r.scatter(np.radians(phi), theta, c=conf, s=sz, cmap=CMAP,
                           alpha=0.85, edgecolors="none", zorder=3)
@@ -495,6 +696,12 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
         cb.ax.tick_params(labelsize=8)
         note = ("one point per muon, size and colour = the network's "
                 "confidence in $\\phi$")
+    elif use_scatter:
+        ax_r.scatter(np.radians(phi), theta, s=14, color=DOT_COLOR,
+                     alpha=0.85, edgecolors="none", zorder=3)
+        ax_cb.set_visible(False)
+        note = ("one point per muon  (single-$\\phi$-output model: no "
+                "per-event confidence)")
     else:
         nph_r = int(round(360.0 / radio_dphi))
         nth_r = int(round(tmax / radio_dtheta))
@@ -504,7 +711,6 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
                                  bins=[pe, te])
         lab = "muons / bin"
         if solid_angle:
-            # bin solid angle = dphi * (cos t_lo - cos t_hi)
             dom = (np.cos(np.radians(te[:-1])) - np.cos(np.radians(te[1:])))
             H = H / (np.diff(pe)[:, None] * dom[None, :])
             lab = "muons / steradian"
@@ -523,8 +729,6 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
                                min(target_phi), max(target_phi)))
         cb.ax.tick_params(labelsize=8)
 
-    # the radiograph caption goes on the figure, not on the axes: a polar
-    # axes title sits on top of the circle and would run into the spectra
     fig.text(0.47, 0.672, r"$\theta$ vs $\phi$ radiograph", ha="center",
              va="top", fontsize=13)
     fig.text(0.47, 0.648,
@@ -532,9 +736,6 @@ def make_page(theta, phi, conf, out_paths, title, subtitle,
              "%.0f$^\\circ$ at the rim),  angle = $\\phi$" % tmax
              + "\n" + note, ha="center", va="top", fontsize=9.5,
              color="0.25", linespacing=1.5)
-    # the theta numbers sit on top of the image, so give them a colour that
-    # survives it: white with a thin dark stroke over the density, the other
-    # way round over the white background of the scatter
     import matplotlib.patheffects as pe_fx
     rc, sc_ = ("white", "black") if not use_scatter else ("0.15", "white")
     plt.setp(ax_r.get_yticklabels(), color=rc, fontsize=9.5,
@@ -561,15 +762,24 @@ def main(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("datafile", help="convertDataFile.py output")
-    p.add_argument("--model-dir", default=MODEL_DIR,
-                   help="directory holding model_scripted.pt and "
-                        "model_config.json (default: the hardcoded path)")
+    p.add_argument("--modelType", default=DEFAULT_MODEL_TYPE,
+                   choices=list(MODEL_TYPES),
+                   help="which trained model to apply (default %s).  Picks "
+                        "the run directory under MODEL_BASE, and is the "
+                        "label put into every output filename"
+                        % DEFAULT_MODEL_TYPE)
+    p.add_argument("--model-dir", default=None,
+                   help="explicit directory holding model_scripted.pt and "
+                        "model_config.json; overrides --modelType, and the "
+                        "label is then taken from its run directory name")
     p.add_argument("-o", "--out", default=None,
-                   help="output text file (default: INPUT_CNN.txt)")
+                   help="output text file (default: INPUT_<label>_CNN.txt)")
     p.add_argument("--min-conf", type=float, default=None,
                    help="drop events whose phi confidence |(s,c)| is below "
                         "this FROM THE PLOTS (every event is still written to "
-                        "the text file, with its confidence)")
+                        "the text file, with its confidence).  Needs a "
+                        "3-output sincos/unitSC model; refused on a 2-output "
+                        "one")
     p.add_argument("--theta-bins", type=int, default=45,
                    help="bins in the 1D theta histogram (default 45)")
     p.add_argument("--phi-bins", type=int, default=36,
@@ -589,10 +799,11 @@ def main(argv=None):
                    help="do not draw the cos^P(theta) sin(theta) reference "
                         "curve")
     p.add_argument("--theta-max", type=float, default=None, metavar="DEG",
-                   help="outer radius of the radiograph and the top of the "
-                        "1D theta axis (default %g, fixed so runs can be "
-                        "compared; events above it are not plotted and the "
-                        "number clipped is reported)" % THETA_MAX_DEG)
+                   help="outer radius of the radiograph, top of the 1D theta "
+                        "axis, AND the theta cut on the 1D phi histogram "
+                        "(default %g, fixed so runs can be compared; events "
+                        "above it are not plotted in any panel and the number "
+                        "clipped is reported)" % THETA_MAX_DEG)
     p.add_argument("--showTarget", action="store_true",
                    help="draw the target region on the radiograph as a light "
                         "blue wedge and make every muon the same red dot on "
@@ -620,9 +831,8 @@ def main(argv=None):
     p.add_argument("--showEventDisplays", action="store_true",
                    help="also write one detector image per event that passes "
                         "every selection -- whatever survived into the input "
-                        "file (trigger, photon and edge cuts from "
-                        "convertDataFile.py) AND the confidence cut here.  "
-                        "They go in INPUT_CNN_displays/, in the style of "
+                        "file AND the confidence cut here.  They go in "
+                        "INPUT_<label>_CNN_displays/, in the style of "
                         "makeEventDisplays.py, with the CNN's own answer for "
                         "that event in the subtitle")
     p.add_argument("--printTextFiles", action="store_true",
@@ -637,16 +847,14 @@ def main(argv=None):
                    help="stop after this many events for BOTH "
                         "--showEventDisplays and --printTextFiles, so the two "
                         "sets match one for one (default %d; 0 means every "
-                        "passing event, which on a large file is a lot of "
-                        "files)" % MAX_DISPLAYS)
+                        "passing event)" % MAX_DISPLAYS)
     p.add_argument("--display-dir", default=None,
                    help="where the event displays and text files go (default: "
-                        "INPUT_CNN_displays next to the input file)")
-    p.add_argument("--display-zmax", type=float, default=None, metavar="ADC",
-                   help="fix the top of the event-display colour scale.  "
-                        "DEFAULT is per event: the largest SiPM value in that "
-                        "event, so every display has exactly one cell at the "
-                        "top of the scale, outlined in cyan")
+                        "INPUT_<label>_CNN_displays next to the input file)")
+    p.add_argument("--display-zmax", type=float, default=None, metavar="N",
+                   help="fix the top of the event-display colour scale in "
+                        "photons.  DEFAULT is per event: the largest SiPM "
+                        "value in that event, outlined in cyan")
     p.add_argument("--display-log", action="store_true",
                    help="logarithmic colour scale on the event displays")
     p.add_argument("--no-pdf", action="store_true")
@@ -657,17 +865,30 @@ def main(argv=None):
     if not os.path.isfile(src):
         sys.exit("no such file: %s" % src)
 
-    stem = src[:-4] if src.lower().endswith(".txt") else src
-    out_txt = args.out or (stem + "_CNN.txt")
-    out_png = stem + "_CNN.png"
-    out_pdf = stem + "_CNN.pdf"
-
+    # ---- which model, its label, and which head it has ----
+    if args.model_dir:
+        label = model_label(args.model_dir)
+    else:
+        label = args.modelType
+        args.model_dir = os.path.join(MODEL_BASE, MODEL_TYPES[label], "model")
     model, cfg = load_model(args.model_dir)
+    head = detect_head(model, cfg, args.model_dir)
+    has_conf = head["has_conf"]
     prov = cfg.get("provenance", {})
     perf = cfg.get("performance_on_test_set", {})
 
+    stem = src[:-4] if src.lower().endswith(".txt") else src
+    # the theta-max actually used: the same rounding make_page applies
+    tmax_eff = args.theta_max if args.theta_max else THETA_MAX_DEG
+    tmax_eff = args.radio_dtheta * np.ceil(tmax_eff / args.radio_dtheta)
+    out_base = "%s_%s_theta%g_CNN" % (stem, label, tmax_eff)
+    out_txt = args.out or (out_base + ".txt")
+    out_png = out_base + ".png"
+    out_pdf = out_base + ".pdf"
+
     print("=" * 78)
-    print("model      %s" % args.model_dir)
+    print("model      %s   (label '%s' in the output names)"
+          % (args.model_dir, label))
     print("           trained %s from %s"
           % (prov.get("trained_at", "?"),
              os.path.basename(prov.get("training_file", "?"))))
@@ -679,6 +900,26 @@ def main(argv=None):
               "sigma_phi %.2f deg"
               % (perf.get("theta_sigma_gauss_deg") or float("nan"),
                  perf.get("phi_sigma_gauss_deg") or float("nan")))
+    loss = cfg.get("training", {}).get("loss")
+    if loss:
+        print("           loss: %s" % loss)
+    print("  head     %s  (%d outputs, measured)" % (head["name"],
+                                                     head["nout"]))
+    print("           %s" % head["decode"])
+    print("           phi_conf: %s" % head["conf_note"])
+    if head["claimed"]:
+        print("           config says '%s' (from %s)"
+              % (head["claimed"], head["claimed_from"]))
+    else:
+        print("           config names no head; decided from the output width "
+              "and postprocessing keys")
+    if head["mismatch"]:
+        print("  WARNING  the config names a %d-output head but the network "
+              "returns %d."
+              % (VARIANT_WIDTH[head["claimed"]], head["nout"]))
+        print("           Decoding by the measured width.  Check that "
+              "model_config.json and")
+        print("           model_scripted.pt came from the same training run.")
     print("-" * 78)
 
     trgid, images, nblocks = read_formatted(src)
@@ -687,10 +928,10 @@ def main(argv=None):
     print("           %d events, %d x %d%s" % (n, NROW, NRING,
           "  (--placeholder block present, skipped)" if nblocks == 2 else ""))
 
-    exp = cfg["format"]
-    if exp["n_rows"] != NROW or exp["num_tiles"] != NRING:
+    fmt = cfg["format"]
+    if fmt["n_rows"] != NROW or fmt["num_tiles"] != NRING:
         sys.exit("the model expects %d x %d, this file is %d x %d"
-                 % (exp["n_rows"], exp["num_tiles"], NROW, NRING))
+                 % (fmt["n_rows"], fmt["num_tiles"], NROW, NRING))
 
     # ---- domain check: is the data anything like what the model saw? ----
     pre = cfg["preprocessing"]
@@ -719,19 +960,53 @@ def main(argv=None):
     print("           compare this with the MC profile: if it looks mirrored, "
           "the ring")
     print("           ordering disagrees and theta will come out backwards.")
+
+    # A model trained inside a restricted phi window cannot predict outside it.
+    win = cfg.get("training", {}).get("phi_window_deg")
+    if win:
+        print("-" * 78)
+        print("  WARNING  this model was trained ONLY on phi in [%g, %g] deg."
+              % (win[0], win[1]))
+        print("           It has never seen a muon outside that window and "
+              "cannot predict one.")
+        print("           The phi histogram and radiograph below are shaped "
+              "by the training")
+        print("           window, NOT by the data.  Do not use this model to "
+              "study azimuthal")
+        print("           structure, and do not compare its phi to the "
+              "full-circle models.")
     print("-" * 78)
 
-    theta, phi, conf = predict(model, cfg, images, args.batch_size)
+    if args.min_conf is not None and not has_conf:
+        sys.exit("--min-conf needs a 3-output sincos/unitSC model.  This one "
+                 "is %s, with a single phi output and no per-event "
+                 "confidence, so there is nothing to cut on." % head["name"])
+    if args.min_conf is not None and head["name"] == "unitSC":
+        print("  note     --min-conf on a unitSC model cuts on a health "
+              "check, not a confidence:")
+        print("           |(s,c)| is pinned near 1 by the loss.")
+        print("-" * 78)
+
+    theta, phi, conf = predict(model, cfg, head, images, args.batch_size)
     tcut = training_cut(images, cfg)
 
     with open(out_txt, "w") as f:
         f.write("# CNN predictions for %s\n" % os.path.abspath(src))
-        f.write("# model: %s\n" % os.path.abspath(args.model_dir))
+        f.write("# model: %s  (%s)\n" % (os.path.abspath(args.model_dir),
+                                         label))
         f.write("#   trained %s from %s\n"
                 % (prov.get("trained_at", "?"),
                    os.path.basename(prov.get("training_file", "?"))))
-        f.write("# theta, phi in degrees.  phi_conf = |(s,c)|, the network's "
-                "confidence in phi (1 = sure, 0 = azimuthally ambiguous).\n")
+        f.write("# head: %s (%d outputs): %s\n"
+                % (head["name"], head["nout"], head["decode"]))
+        if has_conf:
+            f.write("# theta, phi in degrees.  phi_conf = %s.\n"
+                    % head["conf_note"])
+        else:
+            f.write("# theta, phi in degrees.  phi_conf = 0 for every event: "
+                    "this model has a single phi output and no per-event "
+                    "confidence.  The column is kept so the format does not "
+                    "change between models.\n")
         f.write("# train_cut = 1 if the event passes the selection the "
                 "network was trained behind.\n")
         f.write("#%6s %9s %11s %11s %10s %14s %10s\n"
@@ -750,16 +1025,16 @@ def main(argv=None):
                  % (args.min_conf, conf.max()))
 
     tag = os.path.basename(stem)
-    sub = ("%d events%s   |   model %s   |   theta = %.1f +- %.1f deg, "
-           "phi resultant R = %.3f"
+    sub = ("%d events%s   |   model %s (%s head)   |   theta = %.1f +- %.1f "
+           "deg, phi resultant R = %.3f"
            % (int(m.sum()),
               "" if args.min_conf is None
               else " with |(s,c)| >= %g (of %d)" % (args.min_conf, n),
-              os.path.basename(os.path.dirname(args.model_dir)),
+              label, head["name"],
               theta[m].mean(), theta[m].std(), circ_stats(phi[m])[1]))
     style = args.style
     if args.showTarget and style == "auto":
-        style = "scatter"       # "the dots" -- a density has none
+        style = "scatter"       # the dots -- a density has none
 
     paths = [out_png] + ([] if args.no_pdf else [out_pdf])
     tmax, scat = make_page(theta[m], phi[m], conf[m], paths,
@@ -773,7 +1048,8 @@ def main(argv=None):
                            show_cos=not args.no_cos_curve,
                            show_target=args.showTarget,
                            target_theta=args.target_theta,
-                           target_phi=args.target_phi)
+                           target_phi=args.target_phi,
+                           has_conf=has_conf)
 
     cmu, R = circ_stats(phi[m])
     print("predictions over %d events%s"
@@ -792,9 +1068,12 @@ def main(argv=None):
               "sees an asymmetric")
         print("              overburden, but check it is not the network "
               "leaning on a prior.")
-    print("  phi conf median %.3f   [5%%, 95%%] = [%.3f, %.3f]"
-          % (np.median(conf[m]), np.percentile(conf[m], 5),
-             np.percentile(conf[m], 95)))
+    if has_conf:
+        print("  phi conf median %.3f   [5%%, 95%%] = [%.3f, %.3f]%s"
+              % (np.median(conf[m]), np.percentile(conf[m], 5),
+                 np.percentile(conf[m], 95),
+                 "   (unitSC: health check)" if head["name"] == "unitSC"
+                 else ""))
     print("  train cut %d/%d events pass the selection the model was trained "
           "behind" % (int(tcut.sum()), n))
     print("-" * 78)
@@ -813,29 +1092,27 @@ def main(argv=None):
         om_cap = 1.0 - np.cos(np.radians(tmax))
         f_flat = (om_t / om_cap) * ((phi_hi - plo) / 360.0)
         nin = int(tgt.sum())
-        exp = f_flat * int(m.sum())
+        expd = f_flat * int(m.sum())
         print("target     %g < theta < %g deg,  %g < phi < %g deg"
               % (tlo, thi, plo, phi_hi))
         print("           %d of %d muons inside (%.2f %%);  an isotropic "
               "sample would put %.1f there (%.2f %%)"
               % (nin, int(m.sum()), 100.0 * nin / max(int(m.sum()), 1),
-                 exp, 100.0 * f_flat))
-        if exp > 0:
-            print("           ratio to isotropic = %.2f%s"
-                  % (nin / exp,
-                     "   (+-%.2f from counting alone)" % (np.sqrt(max(nin, 1))
-                                                          / exp)))
+                 expd, 100.0 * f_flat))
+        if expd > 0:
+            print("           ratio to isotropic = %.2f   (+-%.2f from "
+                  "counting alone)"
+                  % (nin / expd, np.sqrt(max(nin, 1)) / expd))
     print("wrote %s" % out_txt)
-    for p in paths:
-        print("wrote %s" % p)
+    for p_ in paths:
+        print("wrote %s" % p_)
 
     # ---- per-event output: images, text files, or both ----
-    # one selection, one cap, one directory, so the two sets line up
     if args.showEventDisplays or args.printTextFiles:
-        idx = np.nonzero(m)[0]                  # the events that passed
+        idx = np.nonzero(m)[0]
         cap = len(idx) if args.max_displays <= 0 \
             else min(args.max_displays, len(idx))
-        ddir = args.display_dir or (stem + "_CNN_displays")
+        ddir = args.display_dir or (out_base + "_displays")
         os.makedirs(ddir, exist_ok=True)
 
         wants = [w for w, on in (("displays", args.showEventDisplays),
@@ -859,10 +1136,13 @@ def main(argv=None):
             print("           text    line 1 = TrigID theta phi "
                   "phi_confidence, then the 4 x %d array" % NRING)
             print("                   array as STORED (rows = columns %s, "
-                   "array column 0 = ring %d),"
+                  "array column 0 = ring %d),"
                   % (",".join(COLS), RING_HI))
             print("                   i.e. the same orientation as the input "
                   "file, not the picture")
+            if not has_conf:
+                print("                   phi_confidence is 0 throughout on "
+                      "this %s model" % head["name"])
         print("           output  %s" % ddir)
 
         npng = ntxt = 0
@@ -870,17 +1150,19 @@ def main(argv=None):
             base = "%s_evt%05d_trg%d" % (tag, i, trgid[i])
             if args.showEventDisplays:
                 title = "%s   event %d   TrgID %d" % (tag, i, trgid[i])
-                sub = ("CNN:  $\\theta$ = %.1f$^\\circ$,  $\\phi$ = "
-                       "%.1f$^\\circ$,  $|(s,c)|$ = %.3f\n"
+                conf_bit = ",  $|(s,c)|$ = %.3f" % conf[i] if has_conf else ""
+                tgt_bit = ""
+                if args.showTarget:
+                    tgt_bit = ("   -- IN the target region"
+                               if in_target(theta[i], phi[i],
+                                            args.target_theta,
+                                            args.target_phi)
+                               else "   -- outside the target region")
+                sub = ("CNN (%s):  $\\theta$ = %.1f$^\\circ$,  $\\phi$ = "
+                       "%.1f$^\\circ$%s\n"
                        "%d photons over %d cells%s"
-                       % (theta[i], phi[i], conf[i], int(images[i].sum()),
-                          NROW * NRING,
-                          "" if args.showTarget is False
-                          else ("   -- IN the target region"
-                                if in_target(theta[i], phi[i],
-                                             args.target_theta,
-                                             args.target_phi)
-                                else "   -- outside the target region")))
+                       % (label, theta[i], phi[i], conf_bit,
+                          int(images[i].sum()), NROW * NRING, tgt_bit))
                 draw_photon_event(images[i],
                                   os.path.join(ddir, base + ".png"),
                                   title, sub, vmax=args.display_zmax,
